@@ -242,19 +242,10 @@ class BlockForm(StatesGroup):
     waiting_for_block_reason = State()
 
 # --- Database (SQLite Version) ---
-db = None
+
+
 
 # --- Koyeb Specific: Create database connection function ---
-async def create_db_pool():
-    try:
-        # Connect to SQLite database
-        db = await aiosqlite.connect(DATABASE_PATH)
-        db.row_factory = aiosqlite.Row
-        logger.info(f"SQLite database connection created successfully at {DATABASE_PATH}")
-        return db
-    except Exception as e:
-        logger.error(f"Failed to create database connection: {e}")
-        raise
 
 # --- Helper Functions for Profile Links ---
 def encode_user_id(user_id: int) -> str:
@@ -283,13 +274,9 @@ async def get_encoded_profile_link(user_id: int) -> str:
 
 async def get_user_id_from_encoded(encoded_id: str) -> Optional[int]:
     """Get user ID from encoded string by checking database"""
-    if not db:
-        return None
-    
     try:
         # Get all user IDs and find one that matches the encoding
-        async with db.execute("SELECT user_id FROM user_status") as cursor:
-            users = await cursor.fetchall()
+        users = await execute_query("SELECT user_id FROM user_status")
         
         for user_row in users:
             user_id = user_row['user_id']
@@ -301,11 +288,179 @@ async def get_user_id_from_encoded(encoded_id: str) -> Optional[int]:
     return None
 
 async def setup():
-    global db, bot_info
-    db = await create_db_pool()
-    bot_info = await bot.get_me()
-    logger.info(f"Bot started: @{bot_info.username}")
+    global db, db_pool, bot_info
+    
+    try:
+        if USE_POSTGRESQL:
+            # PostgreSQL setup
+            db_pool = await create_db_pool()
+            await init_postgres_tables()
+        else:
+            # SQLite setup
+            db = await create_db_pool()
+            await init_sqlite_tables()
+        
+        bot_info = await bot.get_me()
+        logger.info(f"Bot started: @{bot_info.username}")
+        
+    except Exception as e:
+        logger.critical(f"Failed to setup database: {e}")
+        raise
 
+async def init_postgres_tables():
+    """Initialize PostgreSQL tables"""
+    try:
+        # Confessions Table (PostgreSQL syntax)
+        await execute_update("""
+            CREATE TABLE IF NOT EXISTS confessions (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                status VARCHAR(20) DEFAULT 'pending',
+                message_id BIGINT,
+                photo_file_id TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                rejection_reason TEXT,
+                categories TEXT
+            );
+        """)
+        logger.info("✅ PostgreSQL 'confessions' table ready")
+
+        # Comments Table
+        await execute_update("""
+            CREATE TABLE IF NOT EXISTS comments (
+                id SERIAL PRIMARY KEY,
+                confession_id INTEGER REFERENCES confessions(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                text TEXT,
+                sticker_file_id TEXT,
+                animation_file_id TEXT,
+                parent_comment_id INTEGER REFERENCES comments(id) ON DELETE SET NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        logger.info("✅ PostgreSQL 'comments' table ready")
+
+        # Reactions Table
+        await execute_update("""
+            CREATE TABLE IF NOT EXISTS reactions (
+                id SERIAL PRIMARY KEY,
+                comment_id INTEGER REFERENCES comments(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                reaction_type VARCHAR(10) NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(comment_id, user_id)
+            );
+        """)
+        logger.info("✅ PostgreSQL 'reactions' table ready")
+
+        # Contact Requests Table
+        await execute_update("""
+            CREATE TABLE IF NOT EXISTS contact_requests (
+                id SERIAL PRIMARY KEY,
+                confession_id INTEGER NOT NULL REFERENCES confessions(id) ON DELETE CASCADE,
+                comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+                requester_user_id BIGINT NOT NULL,
+                requested_user_id BIGINT NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                message TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (comment_id, requester_user_id)
+            );
+        """)
+        logger.info("✅ PostgreSQL 'contact_requests' table ready")
+
+        # User Points Table
+        await execute_update("""
+            CREATE TABLE IF NOT EXISTS user_points (
+                user_id BIGINT PRIMARY KEY,
+                points INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+        logger.info("✅ PostgreSQL 'user_points' table ready")
+
+        # Reports Table
+        await execute_update("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id SERIAL PRIMARY KEY,
+                comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+                reporter_user_id BIGINT NOT NULL,
+                reported_user_id BIGINT NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (comment_id, reporter_user_id)
+            );
+        """)
+        logger.info("✅ PostgreSQL 'reports' table ready")
+
+        # Deletion Requests Table
+        await execute_update("""
+            CREATE TABLE IF NOT EXISTS deletion_requests (
+                id SERIAL PRIMARY KEY,
+                confession_id INTEGER NOT NULL REFERENCES confessions(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW(),
+                reviewed_at TIMESTAMP,
+                UNIQUE (confession_id, user_id)
+            );
+        """)
+        logger.info("✅ PostgreSQL 'deletion_requests' table ready")
+
+        # User Status Table
+        await execute_update("""
+            CREATE TABLE IF NOT EXISTS user_status (
+                user_id BIGINT PRIMARY KEY,
+                has_accepted_rules INTEGER NOT NULL DEFAULT 0,
+                is_blocked INTEGER NOT NULL DEFAULT 0,
+                blocked_until TIMESTAMP,
+                block_reason TEXT,
+                profile_name TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                last_seen TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        logger.info("✅ PostgreSQL 'user_status' table ready")
+
+        # Active Chats Table
+        await execute_update("""
+            CREATE TABLE IF NOT EXISTS active_chats (
+                id SERIAL PRIMARY KEY,
+                user1_id BIGINT NOT NULL,
+                user2_id BIGINT NOT NULL,
+                started_by BIGINT NOT NULL,
+                started_at TIMESTAMP DEFAULT NOW(),
+                last_message_at TIMESTAMP DEFAULT NOW(),
+                is_active INTEGER DEFAULT 1
+            );
+        """)
+        logger.info("✅ PostgreSQL 'active_chats' table ready")
+
+        # Chat Messages Table
+        await execute_update("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id SERIAL PRIMARY KEY,
+                chat_id INTEGER NOT NULL REFERENCES active_chats(id) ON DELETE CASCADE,
+                sender_id BIGINT NOT NULL,
+                message_text TEXT,
+                sticker_file_id TEXT,
+                animation_file_id TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        logger.info("✅ PostgreSQL 'chat_messages' table ready")
+
+        logger.info("✅ All PostgreSQL tables created successfully")
+        
+    except Exception as e:
+        logger.error(f"Error creating PostgreSQL tables: {e}")
+        # Don't raise if tables already exist
+        if "already exists" not in str(e):
+            raise
+
+async def init_sqlite_tables():
+    """Initialize SQLite tables"""
     # --- Confessions Table Schema (SQLite) ---
     await db.execute("""
         CREATE TABLE IF NOT EXISTS confessions (
@@ -460,32 +615,33 @@ async def setup():
 
     await db.commit()
     logger.info("Database tables setup complete.")
-
+# --- Helper Functions ---
 # --- Helper Functions ---
 async def is_admin(user_id: int) -> bool:
     """Check if user is admin"""
     return user_id in ADMIN_IDS
 
 async def get_profile_name(user_id: int) -> str:
-    """Get user's profile name or return Anonymous"""
-    conn = db
-    async with conn.execute("SELECT profile_name FROM user_status WHERE user_id = ?", (user_id,)) as cursor:
-        row = await cursor.fetchone()
-        if row and row['profile_name']:
-            return row['profile_name']
+    row = await fetch_one("SELECT profile_name FROM user_status WHERE user_id = ?", user_id)
+    if row and row['profile_name']:
+        return row['profile_name']
     return "Anonymous"
 
 async def update_profile_name(user_id: int, profile_name: str):
     """Update user's profile name"""
-    conn = db
-    await conn.execute("""
-        INSERT OR REPLACE INTO user_status (user_id, profile_name, last_seen) 
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET 
-        profile_name = excluded.profile_name,
-        last_seen = CURRENT_TIMESTAMP
-    """, (user_id, profile_name))
-    await conn.commit()
+    if USE_POSTGRESQL:
+        await execute_update("""
+            INSERT INTO user_status (user_id, profile_name, last_seen) 
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET 
+            profile_name = EXCLUDED.profile_name,
+            last_seen = NOW()
+        """, user_id, profile_name)
+    else:
+        await execute_update("""
+            INSERT OR REPLACE INTO user_status (user_id, profile_name, last_seen) 
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        """, user_id, profile_name)
 
 def create_category_keyboard(selected_categories: List[str] = None):
     if selected_categories is None:
@@ -503,25 +659,41 @@ def create_category_keyboard(selected_categories: List[str] = None):
     return builder.as_markup()
 
 async def get_comment_reactions(comment_id: int) -> Tuple[int, int]:
-    likes, dislikes = 0, 0
-    conn = db
-    async with conn.execute(
-        "SELECT COALESCE(SUM(CASE WHEN reaction_type = 'like' THEN 1 ELSE 0 END), 0) AS likes, COALESCE(SUM(CASE WHEN reaction_type = 'dislike' THEN 1 ELSE 0 END), 0) AS dislikes FROM reactions WHERE comment_id = ?", (comment_id,)) as cursor:
-        row = await cursor.fetchone()
-        if row:
-            likes, dislikes = row['likes'], row['dislikes']
-    return likes, dislikes
+    row = await fetch_one("""
+        SELECT 
+            COALESCE(SUM(CASE WHEN reaction_type = 'like' THEN 1 ELSE 0 END), 0) AS likes, 
+            COALESCE(SUM(CASE WHEN reaction_type = 'dislike' THEN 1 ELSE 0 END), 0) AS dislikes 
+        FROM reactions 
+        WHERE comment_id = ?
+    """, comment_id)
+    
+    if row:
+        return row['likes'], row['dislikes']
+    return 0, 0
 
 async def get_user_points(user_id: int) -> int:
-    conn = db
-    async with conn.execute("SELECT points FROM user_points WHERE user_id = ?", (user_id,)) as cursor:
-        row = await cursor.fetchone()
-        return row['points'] if row else 0
+    row = await fetch_one("SELECT points FROM user_points WHERE user_id = ?", user_id)
+    return row['points'] if row else 0
 
-async def update_user_points(conn, user_id: int, delta: int):
-    if delta == 0: return
-    await conn.execute("INSERT OR REPLACE INTO user_points (user_id, points) VALUES (?, COALESCE((SELECT points FROM user_points WHERE user_id = ?), 0) + ?)", 
-                      (user_id, user_id, delta))
+async def update_user_points(user_id: int, delta: int):
+    if delta == 0: 
+        return
+    
+    if USE_POSTGRESQL:
+        # PostgreSQL version
+        await execute_update("""
+            INSERT INTO user_points (user_id, points) 
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) 
+            DO UPDATE SET points = user_points.points + EXCLUDED.points
+        """, user_id, delta)
+    else:
+        # SQLite version
+        await execute_update("""
+            INSERT OR REPLACE INTO user_points (user_id, points) 
+            VALUES (?, COALESCE((SELECT points FROM user_points WHERE user_id = ?), 0) + ?)
+        """, user_id, user_id, delta)
+    
     logger.debug(f"Updated points for user {user_id} by {delta}")
 
 async def build_comment_keyboard(comment_id: int, commenter_user_id: int, viewer_user_id: int, confession_owner_id: int, is_admin: bool = False):
@@ -559,7 +731,6 @@ async def safe_send_message(user_id: int, text: str, **kwargs) -> Optional[types
     except Exception as e:
         logger.error(f"Unexpected error sending message to user {user_id}: {e}", exc_info=True)
     return None
-
 async def update_channel_post_button(confession_id: int):
     global bot_info
     await asyncio.sleep(0.1)
@@ -614,8 +785,7 @@ async def get_comment_sequence_number(conn, comment_id: int, confession_id: int)
 
 async def show_comments_for_confession(user_id: int, confession_id: int, message_to_edit: Optional[types.Message] = None, page: int = 1):
     conn = db
-    async with conn.execute("SELECT status, user_id FROM confessions WHERE id = ?", (confession_id,)) as cursor:
-        conf_data = await cursor.fetchone()
+    conf_data = await fetch_one("SELECT status, user_id FROM confessions WHERE id = ?", confession_id)
     
     if not conf_data or conf_data['status'] != 'approved':
         err_txt = f"Confession #{confession_id} not found or not approved."
@@ -626,9 +796,8 @@ async def show_comments_for_confession(user_id: int, confession_id: int, message
         return
     
     confession_owner_id = conf_data['user_id']
-    async with conn.execute("SELECT COUNT(*) FROM comments WHERE confession_id = ?", (confession_id,)) as cursor:
-        total_row = await cursor.fetchone()
-        total_count = total_row[0] if total_row else 0
+    total_row = await fetch_one("SELECT COUNT(*) FROM comments WHERE confession_id = ?", confession_id)
+total_count = total_row[0] if total_row else 0
     
     if total_count == 0:
         msg_text = "<i>No comments yet. Be the first!</i>"
