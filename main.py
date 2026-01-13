@@ -73,14 +73,101 @@ PAGE_SIZE = int(os.getenv("PAGE_SIZE", "15"))  # Number of items per page for pa
 # --- Koyeb Specific: Database Configuration ---
 # Koyeb provides DATABASE_URL for PostgreSQL, but we'll use SQLite for simplicity
 # For production on Koyeb, consider using PostgreSQL
+# --- Database Configuration ---
 DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith('postgresql://'):
-    logging.info("PostgreSQL database URL detected. Using SQLite fallback for now.")
-    # For production, you'd want to adapt to PostgreSQL
-    # For now, we'll use SQLite in the ephemeral storage
-    DATABASE_PATH = "/tmp/confessions.db"  # Koyeb ephemeral storage
+
+# Use PostgreSQL if DATABASE_URL is provided (Koyeb)
+# Otherwise use SQLite (local development)
+if DATABASE_URL and ('postgres://' in DATABASE_URL or 'postgresql://' in DATABASE_URL):
+    USE_POSTGRESQL = True
+    logging.info("Using PostgreSQL database (Koyeb)")
+    
+    # Import asyncpg for PostgreSQL
+    import asyncpg
+    
+    # Global connection pool
+    db_pool = None
+    
+    async def create_db_pool():
+        """Create PostgreSQL connection pool"""
+        global db_pool
+        try:
+            # Remove 'postgresql://' if present, asyncpg needs 'postgres://'
+            connection_string = DATABASE_URL.replace('postgresql://', 'postgres://')
+            
+            db_pool = await asyncpg.create_pool(
+                connection_string,
+                min_size=1,
+                max_size=10,
+                command_timeout=60
+            )
+            logging.info("✅ PostgreSQL connection pool created")
+            return db_pool
+        except Exception as e:
+            logging.error(f"Failed to create PostgreSQL connection: {e}")
+            raise
+    
 else:
-    DATABASE_PATH = "confessions.db"  # Local development
+    # Fallback to SQLite for local development
+    USE_POSTGRESQL = False
+    logging.info("Using SQLite database (local development)")
+    
+    DATABASE_PATH = "confessions.db"
+    db = None
+    
+    async def create_db_pool():
+        """Create SQLite connection"""
+        global db
+        db = await aiosqlite.connect(DATABASE_PATH)
+        db.row_factory = aiosqlite.Row
+        logging.info(f"SQLite database connection created at {DATABASE_PATH}")
+        return db
+
+# Helper functions that work with both databases
+async def execute_query(query: str, *params):
+    """Execute query and return results"""
+    if USE_POSTGRESQL:
+        async with db_pool.acquire() as conn:
+            # Convert SQLite ? placeholders to PostgreSQL $1, $2, etc.
+            converted_query = query
+            param_count = len(params)
+            for i in range(param_count, 0, -1):
+                converted_query = converted_query.replace('?', f'${i}', 1)
+            return await conn.fetch(converted_query, *params)
+    else:
+        async with db.execute(query, params) as cursor:
+            return await cursor.fetchall()
+
+async def fetch_one(query: str, *params):
+    """Fetch single row"""
+    if USE_POSTGRESQL:
+        async with db_pool.acquire() as conn:
+            # Convert placeholders
+            converted_query = query
+            param_count = len(params)
+            for i in range(param_count, 0, -1):
+                converted_query = converted_query.replace('?', f'${i}', 1)
+            row = await conn.fetchrow(converted_query, *params)
+            return row
+    else:
+        async with db.execute(query, params) as cursor:
+            return await cursor.fetchone()
+
+async def execute_update(query: str, *params):
+    """Execute INSERT/UPDATE/DELETE query"""
+    if USE_POSTGRESQL:
+        async with db_pool.acquire() as conn:
+            # Convert placeholders
+            converted_query = query
+            param_count = len(params)
+            for i in range(param_count, 0, -1):
+                converted_query = converted_query.replace('?', f'${i}', 1)
+            result = await conn.execute(converted_query, *params)
+            return result
+    else:
+        async with db.execute(query, params) as cursor:
+            await db.commit()
+            return cursor
 
 HTTP_PORT = int(os.getenv("PORT", "8080"))  # Koyeb uses PORT environment variable
 
