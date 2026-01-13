@@ -219,10 +219,11 @@ async def execute_insert_return_id(query: str, *params):
             for i in range(param_count, 0, -1):
                 converted_query = converted_query.replace('?', f'${i}', 1)
             
-            # For PostgreSQL, ensure RETURNING clause exists
+            # Ensure RETURNING clause exists for PostgreSQL
             if 'RETURNING' not in converted_query.upper():
-                # Add RETURNING id if not present
+                # If it's an INSERT without RETURNING, add it
                 if converted_query.upper().startswith('INSERT'):
+                    # Extract table name and add RETURNING id
                     converted_query = converted_query.rstrip(';') + ' RETURNING id;'
             
             return await conn.fetchval(converted_query, *params)
@@ -2451,20 +2452,20 @@ async def process_confession(message: types.Message, state: FSMContext, text: st
         return
     
     try:
-        # Insert confession
+        # FIXED: Use proper PostgreSQL INSERT with RETURNING
         conf_id = await execute_insert_return_id("""
             INSERT INTO confessions (text, user_id, categories, status, photo_file_id) 
             VALUES ($1, $2, $3, 'pending', $4)
+            RETURNING id
         """, text, user_id, ",".join(selected_categories), photo_file_id)
-        
-        if not conf_id:
-            raise Exception("Failed to get confession ID")
         
         # Update user points
         await update_user_points(user_id, POINTS_PER_CONFESSION)
         
         # Prepare confession preview for admin
         category_tags = " ".join([f"#{html.quote(cat)}" for cat in selected_categories])
+        
+        # ... rest of the function remains the same
         
         if photo_file_id:
             # Send photo with caption to admin
@@ -2973,6 +2974,7 @@ async def admin_panel(message: types.Message):
     await message.answer(admin_text)
 
 @dp.message(Command("stats"))
+@dp.message(Command("stats"))
 async def show_stats(message: types.Message):
     """Show bot statistics"""
     user_id = message.from_user.id
@@ -2983,18 +2985,23 @@ async def show_stats(message: types.Message):
     
     try:
         # Get various stats
-        total_confessions = await fetch_one("SELECT COUNT(*) FROM confessions")
-        approved_confessions = await fetch_one("SELECT COUNT(*) FROM confessions WHERE status = 'approved'")
-        pending_confessions = await fetch_one("SELECT COUNT(*) FROM confessions WHERE status = 'pending'")
-        total_comments = await fetch_one("SELECT COUNT(*) FROM comments")
-        total_users = await fetch_one("SELECT COUNT(*) FROM user_status WHERE has_accepted_rules = 1")
-        blocked_users = await fetch_one("SELECT COUNT(*) FROM user_status WHERE is_blocked = 1")
-        active_chats = await fetch_one("SELECT COUNT(*) FROM active_chats WHERE is_active = 1")
+        total_confessions = await fetch_one("SELECT COUNT(*) as count FROM confessions")
+        approved_confessions = await fetch_one("SELECT COUNT(*) as count FROM confessions WHERE status = 'approved'")
+        pending_confessions = await fetch_one("SELECT COUNT(*) as count FROM confessions WHERE status = 'pending'")
+        total_comments = await fetch_one("SELECT COUNT(*) as count FROM comments")
+        total_users = await fetch_one("SELECT COUNT(*) as count FROM user_status WHERE has_accepted_rules = 1")
+        blocked_users = await fetch_one("SELECT COUNT(*) as count FROM user_status WHERE is_blocked = 1")
+        active_chats = await fetch_one("SELECT COUNT(*) as count FROM active_chats WHERE is_active = 1")
         
-        # Get recent activity
-        today = datetime.now().strftime('%Y-%m-%d')
-        confessions_today = await fetch_one("SELECT COUNT(*) FROM confessions WHERE DATE(created_at) = $1", today)
-        comments_today = await fetch_one("SELECT COUNT(*) FROM comments WHERE DATE(created_at) = $1", today)
+        # Get recent activity - FIXED: Use CURRENT_DATE for PostgreSQL
+        confessions_today = await fetch_one("""
+            SELECT COUNT(*) as count FROM confessions 
+            WHERE created_at::date = CURRENT_DATE
+        """)
+        comments_today = await fetch_one("""
+            SELECT COUNT(*) as count FROM comments 
+            WHERE created_at::date = CURRENT_DATE
+        """)
         
         stats_text = (
             f"📊 <b>Bot Statistics</b>\n\n"
