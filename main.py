@@ -663,7 +663,7 @@ async def show_comments_for_confession(user_id: int, confession_id: int, message
     total_row = await fetch_one("SELECT COUNT(*) as count FROM comments WHERE confession_id = $1", confession_id)
     total_count = total_row['count'] if total_row else 0
     
-    if total_count == 0:
+    if total_count == 0:  # <-- LINE 802: Make sure this is properly indented
         msg_text = "<i>No comments yet. Be the first!</i>"
         if message_to_edit: 
             await message_to_edit.edit_text(msg_text, reply_markup=None)
@@ -672,10 +672,11 @@ async def show_comments_for_confession(user_id: int, confession_id: int, message
         nav = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Add Comment", callback_data=f"add_{confession_id}")]])
         await safe_send_message(user_id, "You can add your own comment below:", reply_markup=nav)
         return
-
+    
     total_pages = (total_count + PAGE_SIZE - 1) // PAGE_SIZE
     page = max(1, min(page, total_pages))
     offset = (page - 1) * PAGE_SIZE
+    # ... rest of the function
     
     comments_raw = await execute_query("""
         SELECT c.id, c.user_id, c.text, c.sticker_file_id, c.animation_file_id, c.parent_comment_id, c.created_at, 
