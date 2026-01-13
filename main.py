@@ -33,6 +33,11 @@ import time
 from collections import defaultdict
 from contextlib import suppress
 
+# --- PostgreSQL Database Imports ---
+import asyncpg
+import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+
 # --- Koyeb Specific: Prevent Multiple Instances with PID check ---
 if os.environ.get('BOT_IS_RUNNING'):
     # Check if it's the same process ID to avoid false positives
@@ -63,113 +68,28 @@ MAX_PHOTO_SIZE_MB = 5  # Maximum photo size in MB
 RATE_LIMIT_SECONDS = 30  # Minimum time between confessions
 user_last_action = defaultdict(float)
 
-# --- Koyeb Specific: Load environment variables ---
+# --- Load environment variables ---
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # Changed from BOT_TOKENS to BOT_TOKEN for Koyeb convention
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS")  # Comma-separated admin IDs
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", "15"))  # Number of items per page for pagination
+HTTP_PORT = int(os.getenv("PORT", "8080"))  # Koyeb uses PORT environment variable
 
-# --- Koyeb Specific: Database Configuration ---
-# Koyeb provides DATABASE_URL for PostgreSQL, but we'll use SQLite for simplicity
-# For production on Koyeb, consider using PostgreSQL
 # --- Database Configuration ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Use PostgreSQL if DATABASE_URL is provided (Koyeb)
-# Otherwise use SQLite (local development)
-if DATABASE_URL and ('postgres://' in DATABASE_URL or 'postgresql://' in DATABASE_URL):
-    USE_POSTGRESQL = True
-    logging.info("Using PostgreSQL database (Koyeb)")
-    
-    # Import asyncpg for PostgreSQL
-    import asyncpg
-    
-    # Global connection pool
-    db_pool = None
-    
-    async def create_db_pool():
-        """Create PostgreSQL connection pool"""
-        global db_pool
-        try:
-            # Remove 'postgresql://' if present, asyncpg needs 'postgres://'
-            connection_string = DATABASE_URL.replace('postgresql://', 'postgres://')
-            
-            db_pool = await asyncpg.create_pool(
-                connection_string,
-                min_size=1,
-                max_size=10,
-                command_timeout=60
-            )
-            logging.info("✅ PostgreSQL connection pool created")
-            return db_pool
-        except Exception as e:
-            logging.error(f"Failed to create PostgreSQL connection: {e}")
-            raise
-    
-else:
-    # Fallback to SQLite for local development
-    USE_POSTGRESQL = False
-    logging.info("Using SQLite database (local development)")
-    
-    DATABASE_PATH = "confessions.db"
-    db = None
-    
-    async def create_db_pool():
-        """Create SQLite connection"""
-        global db
-        db = await aiosqlite.connect(DATABASE_PATH)
-        db.row_factory = aiosqlite.Row
-        logging.info(f"SQLite database connection created at {DATABASE_PATH}")
-        return db
+# Validate essential environment variables
+if not BOT_TOKEN:
+    logging.critical("BOT_TOKEN environment variable is required. Please set it in environment variables.")
+    sys.exit(1)
 
-# Helper functions that work with both databases
-async def execute_query(query: str, *params):
-    """Execute query and return results"""
-    if USE_POSTGRESQL:
-        async with db_pool.acquire() as conn:
-            # Convert SQLite ? placeholders to PostgreSQL $1, $2, etc.
-            converted_query = query
-            param_count = len(params)
-            for i in range(param_count, 0, -1):
-                converted_query = converted_query.replace('?', f'${i}', 1)
-            return await conn.fetch(converted_query, *params)
-    else:
-        async with db.execute(query, params) as cursor:
-            return await cursor.fetchall()
+if not DATABASE_URL:
+    logging.critical("DATABASE_URL environment variable is required for PostgreSQL.")
+    sys.exit(1)
 
-async def fetch_one(query: str, *params):
-    """Fetch single row"""
-    if USE_POSTGRESQL:
-        async with db_pool.acquire() as conn:
-            # Convert placeholders
-            converted_query = query
-            param_count = len(params)
-            for i in range(param_count, 0, -1):
-                converted_query = converted_query.replace('?', f'${i}', 1)
-            row = await conn.fetchrow(converted_query, *params)
-            return row
-    else:
-        async with db.execute(query, params) as cursor:
-            return await cursor.fetchone()
-
-async def execute_update(query: str, *params):
-    """Execute INSERT/UPDATE/DELETE query"""
-    if USE_POSTGRESQL:
-        async with db_pool.acquire() as conn:
-            # Convert placeholders
-            converted_query = query
-            param_count = len(params)
-            for i in range(param_count, 0, -1):
-                converted_query = converted_query.replace('?', f'${i}', 1)
-            result = await conn.execute(converted_query, *params)
-            return result
-    else:
-        async with db.execute(query, params) as cursor:
-            await db.commit()
-            return cursor
-
-HTTP_PORT = int(os.getenv("PORT", "8080"))  # Koyeb uses PORT environment variable
+if not ADMIN_IDS_STR:
+    logging.warning("No admin IDs configured. Add ADMIN_IDS to .env file")
 
 # Parse admin IDs
 ADMIN_IDS: Set[int] = set()
@@ -180,24 +100,12 @@ if ADMIN_IDS_STR:
         except ValueError:
             logging.error(f"Invalid admin ID in ADMIN_IDS: {admin_id_str}")
 
-if not ADMIN_IDS:
-    logging.warning("No admin IDs configured. Add ADMIN_IDS to .env file")
-
-# Validate essential environment variables
-if not BOT_TOKEN:
-    logging.critical("BOT_TOKEN environment variable is required. Please set it in Koyeb environment variables.")
-    sys.exit(1)
-
-if not CHANNEL_ID:
-    logging.warning("CHANNEL_ID not set. Channel posting will be disabled.")
-    CHANNEL_ID = None
-
-# --- Koyeb Specific: Setup logging with proper format ---
+# --- Setup logging ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout)  # Log to stdout for Koyeb
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
@@ -211,6 +119,9 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # Bot info
 bot_info = None
+
+# --- PostgreSQL Connection Pool ---
+db_pool = None
 
 # --- FSM States ---
 class ConfessionForm(StatesGroup):
@@ -241,11 +152,83 @@ class BlockForm(StatesGroup):
     waiting_for_block_duration = State()
     waiting_for_block_reason = State()
 
-# --- Database (SQLite Version) ---
+# --- Database Helper Functions for PostgreSQL ---
+async def execute_query(query: str, *params):
+    """Execute query and return results"""
+    try:
+        if not db_pool:
+            raise Exception("PostgreSQL pool not initialized. Call setup() first.")
+        
+        async with db_pool.acquire() as conn:
+            # Convert SQLite ? placeholders to PostgreSQL $1, $2, etc.
+            converted_query = query
+            param_count = len(params)
+            for i in range(param_count, 0, -1):
+                converted_query = converted_query.replace('?', f'${i}', 1)
+            return await conn.fetch(converted_query, *params)
+    except Exception as e:
+        logger.error(f"Error in execute_query: {e}\nQuery: {query}\nParams: {params}")
+        raise
 
+async def fetch_one(query: str, *params):
+    """Fetch single row"""
+    try:
+        if not db_pool:
+            raise Exception("PostgreSQL pool not initialized. Call setup() first.")
+        
+        async with db_pool.acquire() as conn:
+            # Convert placeholders
+            converted_query = query
+            param_count = len(params)
+            for i in range(param_count, 0, -1):
+                converted_query = converted_query.replace('?', f'${i}', 1)
+            row = await conn.fetchrow(converted_query, *params)
+            return row
+    except Exception as e:
+        logger.error(f"Error in fetch_one: {e}\nQuery: {query}\nParams: {params}")
+        raise
 
+async def execute_update(query: str, *params):
+    """Execute INSERT/UPDATE/DELETE query"""
+    try:
+        if not db_pool:
+            raise Exception("PostgreSQL pool not initialized. Call setup() first.")
+        
+        async with db_pool.acquire() as conn:
+            # Convert placeholders
+            converted_query = query
+            param_count = len(params)
+            for i in range(param_count, 0, -1):
+                converted_query = converted_query.replace('?', f'${i}', 1)
+            result = await conn.execute(converted_query, *params)
+            return result
+    except Exception as e:
+        logger.error(f"Error in execute_update: {e}\nQuery: {query}\nParams: {params}")
+        raise
 
-# --- Koyeb Specific: Create database connection function ---
+async def execute_insert_return_id(query: str, *params):
+    """Execute INSERT and return inserted ID"""
+    try:
+        if not db_pool:
+            raise Exception("PostgreSQL pool not initialized. Call setup() first.")
+        
+        async with db_pool.acquire() as conn:
+            # Convert placeholders
+            converted_query = query
+            param_count = len(params)
+            for i in range(param_count, 0, -1):
+                converted_query = converted_query.replace('?', f'${i}', 1)
+            
+            # For PostgreSQL, ensure RETURNING clause exists
+            if 'RETURNING' not in converted_query.upper():
+                # Add RETURNING id if not present
+                if converted_query.upper().startswith('INSERT'):
+                    converted_query = converted_query.rstrip(';') + ' RETURNING id;'
+            
+            return await conn.fetchval(converted_query, *params)
+    except Exception as e:
+        logger.error(f"Error in execute_insert_return_id: {e}\nQuery: {query}\nParams: {params}")
+        raise
 
 # --- Helper Functions for Profile Links ---
 def encode_user_id(user_id: int) -> str:
@@ -287,18 +270,45 @@ async def get_user_id_from_encoded(encoded_id: str) -> Optional[int]:
     
     return None
 
+async def create_db_pool():
+    """Create PostgreSQL connection pool"""
+    global db_pool
+    try:
+        # Parse connection string - ensure it starts with postgres://
+        connection_string = DATABASE_URL
+        
+        # Convert postgresql:// to postgres:// if needed
+        if connection_string.startswith('postgresql://'):
+            connection_string = connection_string.replace('postgresql://', 'postgres://')
+        
+        # For Koyeb, always use SSL
+        ssl_mode = 'require'
+        
+        db_pool = await asyncpg.create_pool(
+            dsn=connection_string,
+            min_size=1,
+            max_size=10,
+            command_timeout=60,
+            ssl=ssl_mode
+        )
+        logger.info("✅ PostgreSQL connection pool created")
+        return db_pool
+    except Exception as e:
+        logger.error(f"Failed to create PostgreSQL connection: {e}")
+        raise
+
 async def setup():
-    global db, db_pool, bot_info
+    global db_pool, bot_info
     
     try:
-        if USE_POSTGRESQL:
-            # PostgreSQL setup
-            db_pool = await create_db_pool()
-            await init_postgres_tables()
-        else:
-            # SQLite setup
-            db = await create_db_pool()
-            await init_sqlite_tables()
+        # Create PostgreSQL connection pool
+        db_pool = await create_db_pool()
+        
+        # Initialize PostgreSQL tables
+        await init_postgres_tables()
+        
+        # Create indexes for performance
+        await create_postgres_indexes()
         
         bot_info = await bot.get_me()
         logger.info(f"Bot started: @{bot_info.username}")
@@ -310,7 +320,7 @@ async def setup():
 async def init_postgres_tables():
     """Initialize PostgreSQL tables"""
     try:
-        # Confessions Table (PostgreSQL syntax)
+        # Confessions Table
         await execute_update("""
             CREATE TABLE IF NOT EXISTS confessions (
                 id SERIAL PRIMARY KEY,
@@ -459,189 +469,53 @@ async def init_postgres_tables():
         if "already exists" not in str(e):
             raise
 
-async def init_sqlite_tables():
-    """Initialize SQLite tables"""
-    # --- Confessions Table Schema (SQLite) ---
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS confessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            status TEXT DEFAULT 'pending',
-            message_id INTEGER,
-            photo_file_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            rejection_reason TEXT,
-            categories TEXT
-        );
-    """)
-    logger.info("Checked/Created 'confessions' table.")
+async def create_postgres_indexes():
+    """Create performance indexes for PostgreSQL"""
+    try:
+        await execute_update("""
+            CREATE INDEX IF NOT EXISTS idx_confessions_status ON confessions(status);
+            CREATE INDEX IF NOT EXISTS idx_confessions_user_id ON confessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_confessions_created_at ON confessions(created_at);
+            CREATE INDEX IF NOT EXISTS idx_comments_confession_id ON comments(confession_id);
+            CREATE INDEX IF NOT EXISTS idx_comments_user_id ON comments(user_id);
+            CREATE INDEX IF NOT EXISTS idx_comments_created_at ON comments(created_at);
+            CREATE INDEX IF NOT EXISTS idx_reactions_comment_id ON reactions(comment_id);
+            CREATE INDEX IF NOT EXISTS idx_reactions_user_id ON reactions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_contact_requests_status ON contact_requests(status);
+            CREATE INDEX IF NOT EXISTS idx_contact_requests_requester ON contact_requests(requester_user_id);
+            CREATE INDEX IF NOT EXISTS idx_contact_requests_requested ON contact_requests(requested_user_id);
+            CREATE INDEX IF NOT EXISTS idx_user_status_last_seen ON user_status(last_seen);
+            CREATE INDEX IF NOT EXISTS idx_user_status_is_blocked ON user_status(is_blocked);
+            CREATE INDEX IF NOT EXISTS idx_active_chats_user1 ON active_chats(user1_id);
+            CREATE INDEX IF NOT EXISTS idx_active_chats_user2 ON active_chats(user2_id);
+            CREATE INDEX IF NOT EXISTS idx_active_chats_is_active ON active_chats(is_active);
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id ON chat_messages(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at);
+        """)
+        logger.info("✅ PostgreSQL indexes created")
+    except Exception as e:
+        logger.warning(f"Could not create indexes (they may already exist): {e}")
 
-    # --- Comments Table Schema (SQLite) ---
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS comments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            confession_id INTEGER,
-            user_id INTEGER NOT NULL,
-            text TEXT,
-            sticker_file_id TEXT,
-            animation_file_id TEXT,
-            parent_comment_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (confession_id) REFERENCES confessions(id) ON DELETE CASCADE,
-            FOREIGN KEY (parent_comment_id) REFERENCES comments(id) ON DELETE SET NULL
-        );
-    """)
-    logger.info("Checked/Created 'comments' table.")
-
-    # --- Reactions Table (SQLite) ---
-    await db.execute("""
-         CREATE TABLE IF NOT EXISTS reactions (
-             id INTEGER PRIMARY KEY AUTOINCREMENT,
-             comment_id INTEGER,
-             user_id INTEGER NOT NULL,
-             reaction_type TEXT NOT NULL,
-             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-             UNIQUE(comment_id, user_id),
-             FOREIGN KEY (comment_id) REFERENCES comments(id) ON DELETE CASCADE
-         );
-    """)
-    logger.info("Checked/Created 'reactions' table.")
-
-    # --- Contact Requests Table (SQLite) ---
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS contact_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            confession_id INTEGER NOT NULL,
-            comment_id INTEGER NOT NULL,
-            requester_user_id INTEGER NOT NULL,
-            requested_user_id INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            message TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (comment_id, requester_user_id),
-            FOREIGN KEY (confession_id) REFERENCES confessions(id) ON DELETE CASCADE,
-            FOREIGN KEY (comment_id) REFERENCES comments(id) ON DELETE CASCADE
-        );
-    """)
-    logger.info("Checked/Created 'contact_requests' table.")
-
-    # --- User Points Table (SQLite) ---
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS user_points (
-            user_id INTEGER PRIMARY KEY,
-            points INTEGER NOT NULL DEFAULT 0
-        );
-    """)
-    logger.info("Checked/Created 'user_points' table.")
-
-    # --- Reports Table (SQLite) ---
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            comment_id INTEGER NOT NULL,
-            reporter_user_id INTEGER NOT NULL,
-            reported_user_id INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (comment_id, reporter_user_id),
-            FOREIGN KEY (comment_id) REFERENCES comments(id) ON DELETE CASCADE
-        );
-    """)
-    logger.info("Checked/Created 'reports' table.")
-
-    # --- Deletion Requests Table (SQLite) ---
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS deletion_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            confession_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            reviewed_at TIMESTAMP,
-            UNIQUE (confession_id, user_id),
-            FOREIGN KEY (confession_id) REFERENCES confessions(id) ON DELETE CASCADE
-        );
-    """)
-    logger.info("Checked/Created 'deletion_requests' table.")
-
-    # --- User Status Table (SQLite) ---
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS user_status (
-            user_id INTEGER PRIMARY KEY,
-            has_accepted_rules INTEGER NOT NULL DEFAULT 0,
-            is_blocked INTEGER NOT NULL DEFAULT 0,
-            blocked_until TIMESTAMP,
-            block_reason TEXT,
-            profile_name TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    logger.info("Checked/Created 'user_status' table.")
-
-    # --- Active Chats Table (SQLite) ---
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS active_chats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user1_id INTEGER NOT NULL,
-            user2_id INTEGER NOT NULL,
-            started_by INTEGER NOT NULL,
-            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_message_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_active INTEGER DEFAULT 1,
-            FOREIGN KEY (user1_id) REFERENCES user_status(user_id),
-            FOREIGN KEY (user2_id) REFERENCES user_status(user_id)
-        );
-    """)
-    logger.info("Checked/Created 'active_chats' table.")
-
-    # --- Chat Messages Table (SQLite) ---
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            sender_id INTEGER NOT NULL,
-            message_text TEXT,
-            sticker_file_id TEXT,
-            animation_file_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (chat_id) REFERENCES active_chats(id) ON DELETE CASCADE,
-            FOREIGN KEY (sender_id) REFERENCES user_status(user_id)
-        );
-    """)
-    logger.info("Checked/Created 'chat_messages' table.")
-
-    await db.commit()
-    logger.info("Database tables setup complete.")
-# --- Helper Functions ---
 # --- Helper Functions ---
 async def is_admin(user_id: int) -> bool:
     """Check if user is admin"""
     return user_id in ADMIN_IDS
 
 async def get_profile_name(user_id: int) -> str:
-    row = await fetch_one("SELECT profile_name FROM user_status WHERE user_id = ?", user_id)
+    row = await fetch_one("SELECT profile_name FROM user_status WHERE user_id = $1", user_id)
     if row and row['profile_name']:
         return row['profile_name']
     return "Anonymous"
 
 async def update_profile_name(user_id: int, profile_name: str):
     """Update user's profile name"""
-    if USE_POSTGRESQL:
-        await execute_update("""
-            INSERT INTO user_status (user_id, profile_name, last_seen) 
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (user_id) DO UPDATE SET 
-            profile_name = EXCLUDED.profile_name,
-            last_seen = NOW()
-        """, user_id, profile_name)
-    else:
-        await execute_update("""
-            INSERT OR REPLACE INTO user_status (user_id, profile_name, last_seen) 
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-        """, user_id, profile_name)
+    await execute_update("""
+        INSERT INTO user_status (user_id, profile_name, last_seen) 
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (user_id) DO UPDATE SET 
+        profile_name = EXCLUDED.profile_name,
+        last_seen = NOW()
+    """, user_id, profile_name)
 
 def create_category_keyboard(selected_categories: List[str] = None):
     if selected_categories is None:
@@ -664,7 +538,7 @@ async def get_comment_reactions(comment_id: int) -> Tuple[int, int]:
             COALESCE(SUM(CASE WHEN reaction_type = 'like' THEN 1 ELSE 0 END), 0) AS likes, 
             COALESCE(SUM(CASE WHEN reaction_type = 'dislike' THEN 1 ELSE 0 END), 0) AS dislikes 
         FROM reactions 
-        WHERE comment_id = ?
+        WHERE comment_id = $1
     """, comment_id)
     
     if row:
@@ -672,27 +546,19 @@ async def get_comment_reactions(comment_id: int) -> Tuple[int, int]:
     return 0, 0
 
 async def get_user_points(user_id: int) -> int:
-    row = await fetch_one("SELECT points FROM user_points WHERE user_id = ?", user_id)
+    row = await fetch_one("SELECT points FROM user_points WHERE user_id = $1", user_id)
     return row['points'] if row else 0
 
 async def update_user_points(user_id: int, delta: int):
     if delta == 0: 
         return
     
-    if USE_POSTGRESQL:
-        # PostgreSQL version
-        await execute_update("""
-            INSERT INTO user_points (user_id, points) 
-            VALUES ($1, $2)
-            ON CONFLICT (user_id) 
-            DO UPDATE SET points = user_points.points + EXCLUDED.points
-        """, user_id, delta)
-    else:
-        # SQLite version
-        await execute_update("""
-            INSERT OR REPLACE INTO user_points (user_id, points) 
-            VALUES (?, COALESCE((SELECT points FROM user_points WHERE user_id = ?), 0) + ?)
-        """, user_id, user_id, delta)
+    await execute_update("""
+        INSERT INTO user_points (user_id, points) 
+        VALUES ($1, $2)
+        ON CONFLICT (user_id) 
+        DO UPDATE SET points = user_points.points + EXCLUDED.points
+    """, user_id, delta)
     
     logger.debug(f"Updated points for user {user_id} by {delta}")
 
@@ -731,6 +597,7 @@ async def safe_send_message(user_id: int, text: str, **kwargs) -> Optional[types
     except Exception as e:
         logger.error(f"Unexpected error sending message to user {user_id}: {e}", exc_info=True)
     return None
+
 async def update_channel_post_button(confession_id: int):
     global bot_info
     await asyncio.sleep(0.1)
@@ -738,12 +605,10 @@ async def update_channel_post_button(confession_id: int):
         logger.error(f"No bot info or CHANNEL_ID for {confession_id} button update.")
         return
     
-    conn = db
-    async with conn.execute("SELECT message_id FROM confessions WHERE id = ? AND status = 'approved'", (confession_id,)) as cursor:
-        conf_data = await cursor.fetchone()
-    async with conn.execute("SELECT COUNT(*) FROM comments WHERE confession_id = ?", (confession_id,)) as cursor:
-        count_row = await cursor.fetchone()
-        count = count_row[0] if count_row else 0
+    conf_data = await fetch_one("SELECT message_id FROM confessions WHERE id = $1 AND status = 'approved'", confession_id)
+    count_row = await fetch_one("SELECT COUNT(*) as count FROM comments WHERE confession_id = $1", confession_id)
+    
+    count = count_row['count'] if count_row else 0
     
     if not conf_data or not conf_data['message_id']: 
         logger.debug(f"No approved conf/msg_id for {confession_id} button.")
@@ -765,27 +630,25 @@ async def update_channel_post_button(confession_id: int):
     except Exception as e: 
         logger.error(f"Unexpected err updating btn for conf {confession_id}: {e}", exc_info=True)
 
-async def get_comment_sequence_number(conn, comment_id: int, confession_id: int) -> Optional[int]:
+async def get_comment_sequence_number(confession_id: int, comment_id: int) -> Optional[int]:
     """Fetches the sequential number of a specific comment within its confession."""
-    query = """
-        WITH ranked_comments AS (
-            SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC) as rn
-            FROM comments
-            WHERE confession_id = ?
-        )
-        SELECT rn FROM ranked_comments WHERE id = ?;
-    """
     try:
-        async with conn.execute(query, (confession_id, comment_id)) as cursor:
-            row = await cursor.fetchone()
-            return row['rn'] if row else None
+        row = await fetch_one("""
+            WITH ranked_comments AS (
+                SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC) as rn
+                FROM comments
+                WHERE confession_id = $1
+            )
+            SELECT rn FROM ranked_comments WHERE id = $2;
+        """, confession_id, comment_id)
+        
+        return row['rn'] if row else None
     except Exception as e:
         logger.error(f"Could not fetch sequence number for comment {comment_id}: {e}")
         return None
 
 async def show_comments_for_confession(user_id: int, confession_id: int, message_to_edit: Optional[types.Message] = None, page: int = 1):
-    conn = db
-    conf_data = await fetch_one("SELECT status, user_id FROM confessions WHERE id = ?", confession_id)
+    conf_data = await fetch_one("SELECT status, user_id FROM confessions WHERE id = $1", confession_id)
     
     if not conf_data or conf_data['status'] != 'approved':
         err_txt = f"Confession #{confession_id} not found or not approved."
@@ -796,8 +659,9 @@ async def show_comments_for_confession(user_id: int, confession_id: int, message
         return
     
     confession_owner_id = conf_data['user_id']
-    total_row = await fetch_one("SELECT COUNT(*) FROM comments WHERE confession_id = ?", confession_id)
-total_count = total_row[0] if total_row else 0
+    
+    total_row = await fetch_one("SELECT COUNT(*) as count FROM comments WHERE confession_id = $1", confession_id)
+    total_count = total_row['count'] if total_row else 0
     
     if total_count == 0:
         msg_text = "<i>No comments yet. Be the first!</i>"
@@ -813,16 +677,15 @@ total_count = total_row[0] if total_row else 0
     page = max(1, min(page, total_pages))
     offset = (page - 1) * PAGE_SIZE
     
-    async with conn.execute("""
+    comments_raw = await execute_query("""
         SELECT c.id, c.user_id, c.text, c.sticker_file_id, c.animation_file_id, c.parent_comment_id, c.created_at, 
                COALESCE(up.points, 0) as user_points, us.profile_name
         FROM comments c 
         LEFT JOIN user_points up ON c.user_id = up.user_id 
         LEFT JOIN user_status us ON c.user_id = us.user_id
-        WHERE c.confession_id = ? 
-        ORDER BY c.created_at ASC LIMIT ? OFFSET ?
-    """, (confession_id, PAGE_SIZE, offset)) as cursor:
-        comments_raw = await cursor.fetchall()
+        WHERE c.confession_id = $1 
+        ORDER BY c.created_at ASC LIMIT $2 OFFSET $3
+    """, confession_id, PAGE_SIZE, offset)
 
     db_id_to_message_id: Dict[int, int] = {}
     is_admin_user = await is_admin(user_id)
@@ -860,7 +723,7 @@ total_count = total_row[0] if total_row else 0
                 if parent_db_id in db_id_to_message_id:
                     reply_to_msg_id = db_id_to_message_id[parent_db_id]
                 else: 
-                    parent_seq_num = await get_comment_sequence_number(conn, parent_db_id, confession_id)
+                    parent_seq_num = await get_comment_sequence_number(confession_id, parent_db_id)
                     if parent_seq_num:
                         text_reply_prefix = f"↪️ <i>Replying to comment #{parent_seq_num}...</i>\n"
                     else:
@@ -931,31 +794,29 @@ class BlockUserMiddleware(BaseMiddleware):
         if await is_admin(user_id):
             return await handler(event, data)
 
-        conn = db
-        async with conn.execute("SELECT is_blocked, blocked_until, block_reason FROM user_status WHERE user_id = ?", (user_id,)) as cursor:
-            status = await cursor.fetchone()
-        
-        if status and status['is_blocked']:
-            now = datetime.now()
-            # Handle datetime conversion safely
-            blocked_until = None
-            if status['blocked_until']:
-                try:
-                    if isinstance(status['blocked_until'], str):
-                        blocked_until = datetime.fromisoformat(status['blocked_until'].replace('Z', '+00:00'))
-                    else:
-                        blocked_until = status['blocked_until']
-                except:
-                    blocked_until = None
+        try:
+            # Check if user is blocked
+            row = await fetch_one("SELECT is_blocked, blocked_until, block_reason FROM user_status WHERE user_id = $1", user_id)
             
-            if blocked_until and blocked_until < now:
-                # Unblock expired temporary blocks
-                await conn.execute("UPDATE user_status SET is_blocked = 0, blocked_until = NULL, block_reason = NULL WHERE user_id = ?", (user_id,))
-                await conn.commit()
-                return await handler(event, data)
-            else:
-                expiry_info = f"until {blocked_until.strftime('%Y-%m-%d %H:%M %Z')}" if blocked_until else "permanently"
-                reason_info = f"\nReason: <i>{html.quote(status['block_reason'])}</i>" if status['block_reason'] else ""
+            if row and row['is_blocked']:
+                now = datetime.now()
+                blocked_until = row['blocked_until']
+                
+                if blocked_until:
+                    # Parse timestamp
+                    if isinstance(blocked_until, str):
+                        blocked_until = datetime.fromisoformat(blocked_until.replace('Z', '+00:00'))
+                    
+                    if blocked_until < now:
+                        # Unblock expired temporary blocks
+                        await execute_update("UPDATE user_status SET is_blocked = 0, blocked_until = NULL, block_reason = NULL WHERE user_id = $1", user_id)
+                        return await handler(event, data)
+                    else:
+                        expiry_info = f"until {blocked_until.strftime('%Y-%m-%d %H:%M %Z')}"
+                else:
+                    expiry_info = "permanently"
+                
+                reason_info = f"\nReason: <i>{html.quote(row['block_reason'])}</i>" if row['block_reason'] else ""
                 
                 block_message = f"❌ <b>You are blocked from using this bot {expiry_info}.</b>{reason_info}\n\nContact admins if you believe this is a mistake."
 
@@ -966,6 +827,10 @@ class BlockUserMiddleware(BaseMiddleware):
                         await event.answer(block_message)
                 return  # Stop processing the event
 
+        except Exception as e:
+            logger.error(f"Error checking block status for user {user_id}: {e}")
+            # Allow the request to proceed if there's an error checking block status
+        
         return await handler(event, data)
 
 # --- Profile Management Handlers ---
@@ -988,10 +853,8 @@ async def user_profile(message: types.Message):
     user_id = message.from_user.id
     
     # Check if user has accepted rules first
-    conn = db
-    async with conn.execute("SELECT has_accepted_rules FROM user_status WHERE user_id = ?", (user_id,)) as cursor:
-        has_accepted_row = await cursor.fetchone()
-        has_accepted = has_accepted_row['has_accepted_rules'] if has_accepted_row else 0
+    has_accepted_row = await fetch_one("SELECT has_accepted_rules FROM user_status WHERE user_id = $1", user_id)
+    has_accepted = has_accepted_row['has_accepted_rules'] if has_accepted_row else 0
     
     if not has_accepted:
         await message.answer("⚠️ Please use /start first to accept the rules.")
@@ -1068,10 +931,8 @@ async def show_user_confessions(callback_query: types.CallbackQuery):
     except ValueError:
         page = 1
     
-    conn = db
-    async with conn.execute("SELECT COUNT(*) FROM confessions WHERE user_id = ?", (user_id,)) as cursor:
-        total_row = await cursor.fetchone()
-        total_count = total_row[0] if total_row else 0
+    total_row = await fetch_one("SELECT COUNT(*) FROM confessions WHERE user_id = $1", user_id)
+    total_count = total_row['count'] if total_row else 0
     
     if total_count == 0:
         await callback_query.message.edit_text(
@@ -1089,14 +950,13 @@ async def show_user_confessions(callback_query: types.CallbackQuery):
     page = max(1, min(page, total_pages))
     offset = (page - 1) * 5
     
-    async with conn.execute("""
+    confessions = await execute_query("""
         SELECT id, text, status, created_at 
         FROM confessions 
-        WHERE user_id = ? 
+        WHERE user_id = $1 
         ORDER BY created_at DESC 
-        LIMIT 5 OFFSET ?
-    """, (user_id, offset)) as cursor:
-        confessions = await cursor.fetchall()
+        LIMIT 5 OFFSET $2
+    """, user_id, offset)
     
     response_text = f"<b>📜 Your Confessions (Page {page}/{total_pages})</b>\n\n"
     builder = InlineKeyboardBuilder()
@@ -1106,7 +966,7 @@ async def show_user_confessions(callback_query: types.CallbackQuery):
         status_emoji = {"approved": "✅", "pending": "⏳", "rejected": "❌", "deleted": "🗑️"}.get(conf['status'], "❓")
         response_text += f"<b>ID:</b> #{conf['id']} ({status_emoji} {conf['status'].capitalize()})\n"
         response_text += f"<i>\"{snippet}\"</i>\n"
-        response_text += f"<i>Submitted: {conf['created_at'][:10]}</i>\n\n"
+        response_text += f"<i>Submitted: {conf['created_at'].strftime('%Y-%m-%d')}</i>\n\n"
         
         if conf['status'] in ['approved', 'pending']:
             builder.row(InlineKeyboardButton(
@@ -1128,10 +988,8 @@ async def show_user_comments(callback_query: types.CallbackQuery):
     except ValueError:
         page = 1
     
-    conn = db
-    async with conn.execute("SELECT COUNT(*) FROM comments WHERE user_id = ?", (user_id,)) as cursor:
-        total_row = await cursor.fetchone()
-        total_count = total_row[0] if total_row else 0
+    total_row = await fetch_one("SELECT COUNT(*) FROM comments WHERE user_id = $1", user_id)
+    total_count = total_row['count'] if total_row else 0
     
     if total_count == 0:
         await callback_query.message.edit_text(
@@ -1149,16 +1007,15 @@ async def show_user_comments(callback_query: types.CallbackQuery):
     page = max(1, min(page, total_pages))
     offset = (page - 1) * 5
     
-    async with conn.execute("""
+    comments = await execute_query("""
         SELECT c.id, c.text, c.sticker_file_id, c.animation_file_id, c.confession_id, c.created_at,
                conf.text as confession_text
         FROM comments c
         LEFT JOIN confessions conf ON c.confession_id = conf.id
-        WHERE c.user_id = ?
+        WHERE c.user_id = $1
         ORDER BY c.created_at DESC 
-        LIMIT 5 OFFSET ?
-    """, (user_id, offset)) as cursor:
-        comments = await cursor.fetchall()
+        LIMIT 5 OFFSET $2
+    """, user_id, offset)
     
     response_text = f"<b>💬 Your Comments (Page {page}/{total_pages})</b>\n\n"
     
@@ -1179,7 +1036,7 @@ async def show_user_comments(callback_query: types.CallbackQuery):
         response_text += f"<b>On Confession:</b> <a href='{link}'>#{comm['confession_id']}</a>\n"
         response_text += f"<i>\"{conf_snippet}\"</i>\n"
         response_text += f"<b>Your comment:</b> {snippet}\n"
-        response_text += f"<i>Posted: {comm['created_at'][:10]}</i>\n\n"
+        response_text += f"<i>Posted: {comm['created_at'].strftime('%Y-%m-%d')}</i>\n\n"
     
     nav_keyboard = create_profile_pagination_keyboard("profile_comments", page, total_pages)
     await callback_query.message.edit_text(response_text, reply_markup=nav_keyboard, disable_web_page_preview=True)
@@ -1206,10 +1063,8 @@ async def confirm_deletion_request(callback_query: types.CallbackQuery):
     conf_id = int(callback_query.data.split("_")[-1])
     user_id = callback_query.from_user.id
     
-    conn = db
     try:
-        async with conn.execute("SELECT user_id, text, status FROM confessions WHERE id = ?", (conf_id,)) as cursor:
-            conf_data = await cursor.fetchone()
+        conf_data = await fetch_one("SELECT user_id, text, status FROM confessions WHERE id = $1", conf_id)
         
         if not conf_data or conf_data['user_id'] != user_id:
             await callback_query.answer("This is not your confession.", show_alert=True)
@@ -1220,19 +1075,17 @@ async def confirm_deletion_request(callback_query: types.CallbackQuery):
             return
         
         # Check if request already exists
-        async with conn.execute("SELECT id FROM deletion_requests WHERE confession_id = ? AND user_id = ?", (conf_id, user_id)) as cursor:
-            existing_req = await cursor.fetchone()
+        existing_req = await fetch_one("SELECT id FROM deletion_requests WHERE confession_id = $1 AND user_id = $2", conf_id, user_id)
         
         if existing_req:
             await callback_query.answer("You have already requested deletion for this confession.", show_alert=True)
             return
         
         # Create deletion request
-        await conn.execute(
-            """INSERT INTO deletion_requests (confession_id, user_id, status) VALUES (?, ?, 'pending')""", 
-            (conf_id, user_id)
+        await execute_update(
+            """INSERT INTO deletion_requests (confession_id, user_id, status) VALUES ($1, $2, 'pending')""", 
+            conf_id, user_id
         )
-        await conn.commit()
         
         # Notify admins
         snippet = html.quote(conf_data['text'][:200])
@@ -1272,22 +1125,20 @@ async def confirm_deletion_request(callback_query: types.CallbackQuery):
 @dp.callback_query(F.data == "my_active_chats")
 async def show_active_chats(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
-    conn = db
     
-    async with conn.execute("""
+    chats = await execute_query("""
         SELECT ac.id, 
-               CASE WHEN ac.user1_id = ? THEN ac.user2_id ELSE ac.user1_id END as other_user_id,
+               CASE WHEN ac.user1_id = $1 THEN ac.user2_id ELSE ac.user1_id END as other_user_id,
                us.profile_name as other_user_name,
                ac.last_message_at,
                COUNT(cm.id) as message_count
         FROM active_chats ac
-        LEFT JOIN user_status us ON (CASE WHEN ac.user1_id = ? THEN ac.user2_id ELSE ac.user1_id END) = us.user_id
+        LEFT JOIN user_status us ON (CASE WHEN ac.user1_id = $1 THEN ac.user2_id ELSE ac.user1_id END) = us.user_id
         LEFT JOIN chat_messages cm ON ac.id = cm.chat_id
-        WHERE (ac.user1_id = ? OR ac.user2_id = ?) AND ac.is_active = 1
+        WHERE (ac.user1_id = $1 OR ac.user2_id = $1) AND ac.is_active = 1
         GROUP BY ac.id, other_user_id, other_user_name, ac.last_message_at
         ORDER BY ac.last_message_at DESC
-    """, (user_id, user_id, user_id, user_id)) as cursor:
-        chats = await cursor.fetchall()
+    """, user_id)
     
     if not chats:
         await callback_query.message.edit_text(
@@ -1307,7 +1158,7 @@ async def show_active_chats(callback_query: types.CallbackQuery):
     for chat in chats:
         other_user_name = chat['other_user_name'] or "Anonymous"
         message_count = chat['message_count'] or 0
-        last_msg_time = chat['last_message_at'][:19] if chat['last_message_at'] else "No messages"
+        last_msg_time = chat['last_message_at'].strftime('%Y-%m-%d %H:%M') if chat['last_message_at'] else "No messages"
         
         response_text += f"👤 <b>{other_user_name}</b>\n"
         response_text += f"   Messages: {message_count}\n"
@@ -1329,17 +1180,15 @@ async def view_chat_messages(callback_query: types.CallbackQuery, state: FSMCont
     chat_id = int(callback_query.data.split("_")[-1])
     user_id = callback_query.from_user.id
     
-    conn = db
     # Verify user is part of this chat
-    async with conn.execute("""
+    chat_data = await fetch_one("""
         SELECT ac.id, 
-               CASE WHEN ac.user1_id = ? THEN ac.user2_id ELSE ac.user1_id END as other_user_id,
+               CASE WHEN ac.user1_id = $1 THEN ac.user2_id ELSE ac.user1_id END as other_user_id,
                us.profile_name as other_user_name
         FROM active_chats ac
-        LEFT JOIN user_status us ON (CASE WHEN ac.user1_id = ? THEN ac.user2_id ELSE ac.user1_id END) = us.user_id
-        WHERE ac.id = ? AND (ac.user1_id = ? OR ac.user2_id = ?) AND ac.is_active = 1
-    """, (user_id, user_id, chat_id, user_id, user_id)) as cursor:
-        chat_data = await cursor.fetchone()
+        LEFT JOIN user_status us ON (CASE WHEN ac.user1_id = $1 THEN ac.user2_id ELSE ac.user1_id END) = us.user_id
+        WHERE ac.id = $2 AND (ac.user1_id = $1 OR ac.user2_id = $1) AND ac.is_active = 1
+    """, user_id, chat_id)
     
     if not chat_data:
         await callback_query.answer("Chat not found or no longer active.", show_alert=True)
@@ -1353,15 +1202,14 @@ async def view_chat_messages(callback_query: types.CallbackQuery, state: FSMCont
     await state.update_data(chat_id=chat_id, other_user_id=other_user_id)
     
     # Get last 10 messages
-    async with conn.execute("""
+    messages = await execute_query("""
         SELECT cm.*, us.profile_name as sender_name
         FROM chat_messages cm
         LEFT JOIN user_status us ON cm.sender_id = us.user_id
-        WHERE cm.chat_id = ?
+        WHERE cm.chat_id = $1
         ORDER BY cm.created_at DESC
         LIMIT 10
-    """, (chat_id,)) as cursor:
-        messages = await cursor.fetchall()
+    """, chat_id)
     
     response_text = f"💬 <b>Chat with {other_user_name}</b>\n\n"
     
@@ -1371,7 +1219,7 @@ async def view_chat_messages(callback_query: types.CallbackQuery, state: FSMCont
         # Show messages in chronological order
         for msg in reversed(messages):
             sender_name = msg['sender_name'] or ("You" if msg['sender_id'] == user_id else "Anonymous")
-            time_str = msg['created_at'][11:16] if msg['created_at'] else ""
+            time_str = msg['created_at'].strftime('%H:%M') if msg['created_at'] else ""
             
             if msg['message_text']:
                 response_text += f"<b>{sender_name}</b> ({time_str}):\n"
@@ -1425,36 +1273,33 @@ async def handle_chat_message(message: types.Message, state: FSMContext):
             await message.answer("Commands are not forwarded in chats. Use them outside of chat mode.")
         return
     
-    conn = db
     try:
         # Save message
         if message.text:
-            await conn.execute("""
+            await execute_update("""
                 INSERT INTO chat_messages (chat_id, sender_id, message_text)
-                VALUES (?, ?, ?)
-            """, (chat_id, user_id, message.text))
+                VALUES ($1, $2, $3)
+            """, chat_id, user_id, message.text)
         elif message.sticker:
-            await conn.execute("""
+            await execute_update("""
                 INSERT INTO chat_messages (chat_id, sender_id, sticker_file_id)
-                VALUES (?, ?, ?)
-            """, (chat_id, user_id, message.sticker.file_id))
+                VALUES ($1, $2, $3)
+            """, chat_id, user_id, message.sticker.file_id)
         elif message.animation:
-            await conn.execute("""
+            await execute_update("""
                 INSERT INTO chat_messages (chat_id, sender_id, animation_file_id)
-                VALUES (?, ?, ?)
-            """, (chat_id, user_id, message.animation.file_id))
+                VALUES ($1, $2, $3)
+            """, chat_id, user_id, message.animation.file_id)
         else:
             await message.answer("Only text, stickers, and GIFs are supported in chats.")
             return
         
         # Update last message time
-        await conn.execute("""
+        await execute_update("""
             UPDATE active_chats 
-            SET last_message_at = CURRENT_TIMESTAMP 
-            WHERE id = ?
-        """, (chat_id,))
-        
-        await conn.commit()
+            SET last_message_at = NOW() 
+            WHERE id = $1
+        """, chat_id)
         
         # Forward message to other user
         try:
@@ -1484,14 +1329,12 @@ async def disconnect_chat(callback_query: types.CallbackQuery, state: FSMContext
     chat_id = int(callback_query.data.split("_")[-1])
     user_id = callback_query.from_user.id
     
-    conn = db
     try:
         # Get other user info
-        async with conn.execute("""
+        chat_data = await fetch_one("""
             SELECT user1_id, user2_id FROM active_chats 
-            WHERE id = ? AND (user1_id = ? OR user2_id = ?) AND is_active = 1
-        """, (chat_id, user_id, user_id)) as cursor:
-            chat_data = await cursor.fetchone()
+            WHERE id = $1 AND (user1_id = $2 OR user2_id = $2) AND is_active = 1
+        """, chat_id, user_id)
         
         if not chat_data:
             await callback_query.answer("Chat not found.", show_alert=True)
@@ -1500,8 +1343,7 @@ async def disconnect_chat(callback_query: types.CallbackQuery, state: FSMContext
         other_user_id = chat_data['user1_id'] if chat_data['user2_id'] == user_id else chat_data['user2_id']
         
         # Deactivate chat
-        await conn.execute("UPDATE active_chats SET is_active = 0 WHERE id = ?", (chat_id,))
-        await conn.commit()
+        await execute_update("UPDATE active_chats SET is_active = 0 WHERE id = $1", chat_id)
         
         # Clear state if in chat
         current_state = await state.get_state()
@@ -1563,15 +1405,13 @@ async def view_user_profile(callback_query: types.CallbackQuery):
         await user_profile(callback_query.message)
         return
     
-    conn = db
     # Get target user info
-    async with conn.execute("""
+    user_data = await fetch_one("""
         SELECT us.profile_name, up.points, us.user_id
         FROM user_status us
         LEFT JOIN user_points up ON us.user_id = up.user_id
-        WHERE us.user_id = ?
-    """, (target_user_id,)) as cursor:
-        user_data = await cursor.fetchone()
+        WHERE us.user_id = $1
+    """, target_user_id)
     
     if not user_data:
         await callback_query.answer("User not found.", show_alert=True)
@@ -1581,29 +1421,26 @@ async def view_user_profile(callback_query: types.CallbackQuery):
     points = user_data['points'] or 0
     
     # Check if there's already an active chat
-    async with conn.execute("""
+    existing_chat = await fetch_one("""
         SELECT id FROM active_chats 
-        WHERE ((user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)) 
+        WHERE ((user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)) 
         AND is_active = 1
-    """, (viewer_user_id, target_user_id, target_user_id, viewer_user_id)) as cursor:
-        existing_chat = await cursor.fetchone()
+    """, viewer_user_id, target_user_id)
     
     # Check if there's a pending contact request FROM viewer TO target
-    async with conn.execute("""
+    pending_request = await fetch_one("""
         SELECT id, status FROM contact_requests 
-        WHERE requester_user_id = ? AND requested_user_id = ? 
+        WHERE requester_user_id = $1 AND requested_user_id = $2 
         AND status = 'pending'
-    """, (viewer_user_id, target_user_id)) as cursor:
-        pending_request = await cursor.fetchone()
+    """, viewer_user_id, target_user_id)
     
     # Check if there's an approved contact request in either direction
-    async with conn.execute("""
+    approved_request = await fetch_one("""
         SELECT id FROM contact_requests 
-        WHERE ((requester_user_id = ? AND requested_user_id = ?) 
-        OR (requester_user_id = ? AND requested_user_id = ?))
+        WHERE ((requester_user_id = $1 AND requested_user_id = $2) 
+        OR (requester_user_id = $2 AND requested_user_id = $1))
         AND status = 'approved'
-    """, (viewer_user_id, target_user_id, target_user_id, viewer_user_id)) as cursor:
-        approved_request = await cursor.fetchone()
+    """, viewer_user_id, target_user_id)
     
     profile_text = f"👤 <b>User Profile</b>\n\n"
     profile_text += f"📛 <b>Display Name:</b> {profile_name}\n"
@@ -1648,7 +1485,6 @@ async def get_user_id(message: types.Message):
         target_username = message.reply_to_message.from_user.username
         
         # Get user profile info from database
-        conn = db
         profile_name = await get_profile_name(target_id)
         points = await get_user_points(target_id)
         
@@ -1663,15 +1499,14 @@ async def get_user_id(message: types.Message):
         response_text += f"<b>Aura Points:</b> {points}\n"
         
         # Check if user is blocked
-        async with conn.execute("SELECT is_blocked, blocked_until FROM user_status WHERE user_id = ?", (target_id,)) as cursor:
-            status = await cursor.fetchone()
-            if status and status['is_blocked']:
-                if status['blocked_until']:
-                    response_text += f"<b>Status:</b> ⏸️ Blocked until {status['blocked_until'][:19]}\n"
-                else:
-                    response_text += f"<b>Status:</b> 🚫 Permanently blocked\n"
+        status = await fetch_one("SELECT is_blocked, blocked_until FROM user_status WHERE user_id = $1", target_id)
+        if status and status['is_blocked']:
+            if status['blocked_until']:
+                response_text += f"<b>Status:</b> ⏸️ Blocked until {status['blocked_until'].strftime('%Y-%m-%d %H:%M')}\n"
             else:
-                response_text += f"<b>Status:</b> ✅ Active\n"
+                response_text += f"<b>Status:</b> 🚫 Permanently blocked\n"
+        else:
+            response_text += f"<b>Status:</b> ✅ Active\n"
         
         await message.answer(response_text)
     else:
@@ -1682,9 +1517,6 @@ async def get_user_id(message: types.Message):
             # Try to parse the user ID from arguments
             try:
                 target_id = int(command_args[1])
-                
-                # Get user info from database
-                conn = db
                 
                 # Try to get user info from Telegram API first
                 try:
@@ -1710,15 +1542,14 @@ async def get_user_id(message: types.Message):
                 response_text += f"<b>Aura Points:</b> {points}\n"
                 
                 # Check if user is blocked
-                async with conn.execute("SELECT is_blocked, blocked_until FROM user_status WHERE user_id = ?", (target_id,)) as cursor:
-                    status = await cursor.fetchone()
-                    if status and status['is_blocked']:
-                        if status['blocked_until']:
-                            response_text += f"<b>Status:</b> ⏸️ Blocked until {status['blocked_until'][:19]}\n"
-                        else:
-                            response_text += f"<b>Status:</b> 🚫 Permanently blocked\n"
+                status = await fetch_one("SELECT is_blocked, blocked_until FROM user_status WHERE user_id = $1", target_id)
+                if status and status['is_blocked']:
+                    if status['blocked_until']:
+                        response_text += f"<b>Status:</b> ⏸️ Blocked until {status['blocked_until'].strftime('%Y-%m-%d %H:%M')}\n"
                     else:
-                        response_text += f"<b>Status:</b> ✅ Active\n"
+                        response_text += f"<b>Status:</b> 🚫 Permanently blocked\n"
+                else:
+                    response_text += f"<b>Status:</b> ✅ Active\n"
                 
                 await message.answer(response_text)
                 return
@@ -1752,15 +1583,13 @@ async def show_user_profile_directly(message: types.Message, target_user_id: int
         await user_profile(message)
         return
     
-    conn = db
     # Get target user info
-    async with conn.execute("""
+    user_data = await fetch_one("""
         SELECT us.profile_name, up.points, us.user_id
         FROM user_status us
         LEFT JOIN user_points up ON us.user_id = up.user_id
-        WHERE us.user_id = ?
-    """, (target_user_id,)) as cursor:
-        user_data = await cursor.fetchone()
+        WHERE us.user_id = $1
+    """, target_user_id)
     
     if not user_data:
         await message.answer("User not found.")
@@ -1770,29 +1599,26 @@ async def show_user_profile_directly(message: types.Message, target_user_id: int
     points = user_data['points'] or 0
     
     # Check if there's already an active chat
-    async with conn.execute("""
+    existing_chat = await fetch_one("""
         SELECT id FROM active_chats 
-        WHERE ((user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)) 
+        WHERE ((user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)) 
         AND is_active = 1
-    """, (viewer_user_id, target_user_id, target_user_id, viewer_user_id)) as cursor:
-        existing_chat = await cursor.fetchone()
+    """, viewer_user_id, target_user_id)
     
     # Check if there's a pending contact request FROM viewer TO target
-    async with conn.execute("""
+    pending_request = await fetch_one("""
         SELECT id, status FROM contact_requests 
-        WHERE requester_user_id = ? AND requested_user_id = ? 
+        WHERE requester_user_id = $1 AND requested_user_id = $2 
         AND status = 'pending'
-    """, (viewer_user_id, target_user_id)) as cursor:
-        pending_request = await cursor.fetchone()
+    """, viewer_user_id, target_user_id)
     
     # Check if there's an approved contact request in either direction
-    async with conn.execute("""
+    approved_request = await fetch_one("""
         SELECT id FROM contact_requests 
-        WHERE ((requester_user_id = ? AND requested_user_id = ?) 
-        OR (requester_user_id = ? AND requested_user_id = ?))
+        WHERE ((requester_user_id = $1 AND requested_user_id = $2) 
+        OR (requester_user_id = $2 AND requested_user_id = $1))
         AND status = 'approved'
-    """, (viewer_user_id, target_user_id, target_user_id, viewer_user_id)) as cursor:
-        approved_request = await cursor.fetchone()
+    """, viewer_user_id, target_user_id)
     
     profile_text = f"👤 <b>User Profile</b>\n\n"
     profile_text += f"📛 <b>Display Name:</b> {profile_name}\n"
@@ -1833,25 +1659,22 @@ async def request_contact_start(callback_query: types.CallbackQuery, state: FSMC
         await callback_query.answer("You cannot request contact with yourself.", show_alert=True)
         return
     
-    conn = db
     # Check if request already exists
-    async with conn.execute("""
+    existing_request = await fetch_one("""
         SELECT id FROM contact_requests 
-        WHERE requester_user_id = ? AND requested_user_id = ?
-    """, (requester_user_id, target_user_id)) as cursor:
-        existing_request = await cursor.fetchone()
+        WHERE requester_user_id = $1 AND requested_user_id = $2
+    """, requester_user_id, target_user_id)
     
     if existing_request:
         await callback_query.answer("You already have a pending request with this user.", show_alert=True)
         return
     
     # Check if there's already an active chat
-    async with conn.execute("""
+    existing_chat = await fetch_one("""
         SELECT id FROM active_chats 
-        WHERE ((user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)) 
+        WHERE ((user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)) 
         AND is_active = 1
-    """, (requester_user_id, target_user_id, target_user_id, requester_user_id)) as cursor:
-        existing_chat = await cursor.fetchone()
+    """, requester_user_id, target_user_id)
     
     if existing_chat:
         await callback_query.answer("You already have an active chat with this user.", show_alert=True)
@@ -1894,41 +1717,36 @@ async def receive_contact_message(message: types.Message, state: FSMContext):
     if message_text.lower() == "/skip":
         message_text = ""
     
-    conn = db
     try:
         # Get a valid confession where both users have interacted
-        async with conn.execute("""
+        confession_data = await fetch_one("""
             SELECT DISTINCT c.id 
             FROM confessions c 
             JOIN comments com ON c.id = com.confession_id 
-            WHERE (c.user_id = ? AND com.user_id = ?) 
-               OR (c.user_id = ? AND com.user_id = ?)
+            WHERE (c.user_id = $1 AND com.user_id = $2) 
+               OR (c.user_id = $2 AND com.user_id = $1)
             LIMIT 1
-        """, (user_id, target_user_id, target_user_id, user_id)) as cursor:
-            confession_data = await cursor.fetchone()
+        """, user_id, target_user_id)
         
         confession_id = confession_data['id'] if confession_data else 0
         
         # Get a comment ID where they interacted
         comment_id = 0
         if confession_id > 0:
-            async with conn.execute("""
+            comment_data = await fetch_one("""
                 SELECT id FROM comments 
-                WHERE confession_id = ? AND (user_id = ? OR user_id = ?)
+                WHERE confession_id = $1 AND (user_id = $2 OR user_id = $3)
                 LIMIT 1
-            """, (confession_id, user_id, target_user_id)) as cursor:
-                comment_data = await cursor.fetchone()
+            """, confession_id, user_id, target_user_id)
             
             comment_id = comment_data['id'] if comment_data else 0
         
         # Create contact request
-        await conn.execute("""
+        await execute_update("""
             INSERT INTO contact_requests 
             (confession_id, comment_id, requester_user_id, requested_user_id, status, message) 
-            VALUES (?, ?, ?, ?, 'pending', ?)
-        """, (confession_id, comment_id, user_id, target_user_id, message_text))
-        
-        await conn.commit()
+            VALUES ($1, $2, $3, $4, 'pending', $5)
+        """, confession_id, comment_id, user_id, target_user_id, message_text)
         
         # Get requester profile name
         requester_profile = await get_profile_name(user_id)
@@ -1988,22 +1806,19 @@ async def approve_contact_request(callback_query: types.CallbackQuery):
         await callback_query.answer("Invalid request.", show_alert=True)
         return
     
-    conn = db
     try:
         # Update contact request status
-        await conn.execute("""
+        await execute_update("""
             UPDATE contact_requests 
             SET status = 'approved' 
-            WHERE requester_user_id = ? AND requested_user_id = ? AND status = 'pending'
-        """, (requester_user_id, approver_user_id))
+            WHERE requester_user_id = $1 AND requested_user_id = $2 AND status = 'pending'
+        """, requester_user_id, approver_user_id)
         
         # Create active chat
-        await conn.execute("""
+        await execute_update("""
             INSERT INTO active_chats (user1_id, user2_id, started_by)
-            VALUES (?, ?, ?)
-        """, (requester_user_id, approver_user_id, requester_user_id))
-        
-        await conn.commit()
+            VALUES ($1, $2, $3)
+        """, requester_user_id, approver_user_id, requester_user_id)
         
         # Get profile names
         requester_profile = await get_profile_name(requester_user_id)
@@ -2012,12 +1827,11 @@ async def approve_contact_request(callback_query: types.CallbackQuery):
         # Notify requester
         try:
             # Get chat ID
-            async with conn.execute("""
+            chat_data = await fetch_one("""
                 SELECT id FROM active_chats 
-                WHERE user1_id = ? AND user2_id = ? 
+                WHERE user1_id = $1 AND user2_id = $2 
                 ORDER BY id DESC LIMIT 1
-            """, (requester_user_id, approver_user_id)) as cursor:
-                chat_data = await cursor.fetchone()
+            """, requester_user_id, approver_user_id)
             
             if chat_data:
                 chat_id = chat_data['id']
@@ -2058,16 +1872,13 @@ async def reject_contact_request(callback_query: types.CallbackQuery):
         await callback_query.answer("Invalid request.", show_alert=True)
         return
     
-    conn = db
     try:
         # Update contact request status
-        await conn.execute("""
+        await execute_update("""
             UPDATE contact_requests 
             SET status = 'rejected' 
-            WHERE requester_user_id = ? AND requested_user_id = ? AND status = 'pending'
-        """, (requester_user_id, rejecter_user_id))
-        
-        await conn.commit()
+            WHERE requester_user_id = $1 AND requested_user_id = $2 AND status = 'pending'
+        """, requester_user_id, rejecter_user_id)
         
         # Get profile names
         requester_profile = await get_profile_name(requester_user_id)
@@ -2101,16 +1912,14 @@ async def reject_contact_request(callback_query: types.CallbackQuery):
 async def show_pending_contact_requests(callback_query: types.CallbackQuery):
     """Show pending contact requests for the user"""
     user_id = callback_query.from_user.id
-    conn = db
     
-    async with conn.execute("""
+    requests = await execute_query("""
         SELECT cr.id, cr.requester_user_id, cr.message, cr.created_at, us.profile_name
         FROM contact_requests cr
         LEFT JOIN user_status us ON cr.requester_user_id = us.user_id
-        WHERE cr.requested_user_id = ? AND cr.status = 'pending'
+        WHERE cr.requested_user_id = $1 AND cr.status = 'pending'
         ORDER BY cr.created_at DESC
-    """, (user_id,)) as cursor:
-        requests = await cursor.fetchall()
+    """, user_id)
     
     if not requests:
         await callback_query.message.edit_text(
@@ -2129,7 +1938,7 @@ async def show_pending_contact_requests(callback_query: types.CallbackQuery):
     for req in requests:
         profile_name = req['profile_name'] or "Anonymous"
         message = req['message'] or "No message"
-        time_str = req['created_at'][:19] if req['created_at'] else ""
+        time_str = req['created_at'].strftime('%Y-%m-%d %H:%M') if req['created_at'] else ""
         
         response_text += f"👤 <b>{profile_name}</b>\n"
         response_text += f"<i>Message:</i> {html.quote(message[:50])}{'...' if len(message) > 50 else ''}\n"
@@ -2155,15 +1964,13 @@ async def start_chat_from_profile(callback_query: types.CallbackQuery, state: FS
         await callback_query.answer("Invalid user ID.", show_alert=True)
         return
     
-    conn = db
     try:
         # Check if chat already exists
-        async with conn.execute("""
+        existing_chat = await fetch_one("""
             SELECT id FROM active_chats 
-            WHERE ((user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)) 
+            WHERE ((user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)) 
             AND is_active = 1
-        """, (user_id, target_user_id, target_user_id, user_id)) as cursor:
-            existing_chat = await cursor.fetchone()
+        """, user_id, target_user_id)
         
         if existing_chat:
             # Go to existing chat
@@ -2173,20 +1980,17 @@ async def start_chat_from_profile(callback_query: types.CallbackQuery, state: FS
             return
         
         # Create new chat
-        await conn.execute("""
+        await execute_update("""
             INSERT INTO active_chats (user1_id, user2_id, started_by)
-            VALUES (?, ?, ?)
-        """, (user_id, target_user_id, user_id))
-        
-        await conn.commit()
+            VALUES ($1, $2, $3)
+        """, user_id, target_user_id, user_id)
         
         # Get chat ID
-        async with conn.execute("""
+        chat_data = await fetch_one("""
             SELECT id FROM active_chats 
-            WHERE user1_id = ? AND user2_id = ? 
+            WHERE user1_id = $1 AND user2_id = $2 
             ORDER BY id DESC LIMIT 1
-        """, (user_id, target_user_id)) as cursor:
-            chat_data = await cursor.fetchone()
+        """, user_id, target_user_id)
         
         if chat_data:
             chat_id = chat_data['id']
@@ -2227,9 +2031,7 @@ async def add_comment_start(callback_query: types.CallbackQuery, state: FSMConte
         return
     
     # Check if confession exists and is approved
-    conn = db
-    async with conn.execute("SELECT status FROM confessions WHERE id = ?", (confession_id,)) as cursor:
-        conf_data = await cursor.fetchone()
+    conf_data = await fetch_one("SELECT status FROM confessions WHERE id = $1", confession_id)
     
     if not conf_data or conf_data['status'] != 'approved':
         await callback_query.answer("This confession is not available for comments.", show_alert=True)
@@ -2256,9 +2058,7 @@ async def reply_comment_start(callback_query: types.CallbackQuery, state: FSMCon
         return
     
     # Get confession ID from the comment
-    conn = db
-    async with conn.execute("SELECT confession_id FROM comments WHERE id = ?", (comment_id,)) as cursor:
-        comment_data = await cursor.fetchone()
+    comment_data = await fetch_one("SELECT confession_id FROM comments WHERE id = $1", comment_id)
     
     if not comment_data:
         await callback_query.answer("Comment not found.", show_alert=True)
@@ -2267,8 +2067,7 @@ async def reply_comment_start(callback_query: types.CallbackQuery, state: FSMCon
     confession_id = comment_data['confession_id']
     
     # Check if confession is approved
-    async with conn.execute("SELECT status FROM confessions WHERE id = ?", (confession_id,)) as cursor:
-        conf_data = await cursor.fetchone()
+    conf_data = await fetch_one("SELECT status FROM confessions WHERE id = $1", confession_id)
     
     if not conf_data or conf_data['status'] != 'approved':
         await callback_query.answer("This confession is not available for comments.", show_alert=True)
@@ -2326,23 +2125,23 @@ async def process_comment(message: types.Message, state: FSMContext, text: Optio
         return
     
     try:
-        conn = db
         # Insert comment
-        await conn.execute("""
+        comment_id = await execute_insert_return_id("""
             INSERT INTO comments (confession_id, user_id, text, sticker_file_id, animation_file_id, parent_comment_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (confession_id, user_id, text, sticker_file_id, animation_file_id, parent_comment_id))
+            VALUES ($1, $2, $3, $4, $5, $6)
+        """, confession_id, user_id, text, sticker_file_id, animation_file_id, parent_comment_id)
+        
+        if not comment_id:
+            raise Exception("Failed to get comment ID")
         
         # Update user points for commenting
-        await update_user_points(conn, user_id, 1)
-        await conn.commit()
+        await update_user_points(user_id, 1)
         
         # Get user's profile name
         profile_name = await get_profile_name(user_id)
         
         # Notify confession owner if it's not their own comment
-        async with conn.execute("SELECT user_id FROM confessions WHERE id = ?", (confession_id,)) as cursor:
-            conf_owner = await cursor.fetchone()
+        conf_owner = await fetch_one("SELECT user_id FROM confessions WHERE id = $1", confession_id)
         
         if conf_owner and conf_owner['user_id'] != user_id:
             await safe_send_message(
@@ -2362,7 +2161,7 @@ async def process_comment(message: types.Message, state: FSMContext, text: Optio
             f"<i>View all comments: https://t.me/{bot_info.username}?start=view_{confession_id}</i>"
         )
         
-        logger.info(f"Comment added to confession #{confession_id} by user {user_id}")
+        logger.info(f"Comment #{comment_id} added to confession #{confession_id} by user {user_id}")
         
     except Exception as e:
         logger.error(f"Error adding comment to confession #{confession_id}: {e}", exc_info=True)
@@ -2390,11 +2189,9 @@ async def handle_reaction(callback_query: types.CallbackQuery, reaction_type: st
         await callback_query.answer("Invalid reaction.", show_alert=True)
         return
     
-    conn = db
     try:
         # Get comment owner first
-        async with conn.execute("SELECT user_id FROM comments WHERE id = ?", (comment_id,)) as cursor:
-            comment_data = await cursor.fetchone()
+        comment_data = await fetch_one("SELECT user_id FROM comments WHERE id = $1", comment_id)
         
         if not comment_data:
             await callback_query.answer("Comment not found.", show_alert=True)
@@ -2408,47 +2205,44 @@ async def handle_reaction(callback_query: types.CallbackQuery, reaction_type: st
             return
         
         # Check if user already reacted
-        async with conn.execute(
-            "SELECT reaction_type FROM reactions WHERE comment_id = ? AND user_id = ?",
-            (comment_id, user_id)
-        ) as cursor:
-            existing_reaction = await cursor.fetchone()
+        existing_reaction = await fetch_one(
+            "SELECT reaction_type FROM reactions WHERE comment_id = $1 AND user_id = $2",
+            comment_id, user_id
+        )
         
         if existing_reaction:
             if existing_reaction['reaction_type'] == reaction_type:
                 # Remove reaction if clicking same button
-                await conn.execute(
-                    "DELETE FROM reactions WHERE comment_id = ? AND user_id = ?",
-                    (comment_id, user_id)
+                await execute_update(
+                    "DELETE FROM reactions WHERE comment_id = $1 AND user_id = $2",
+                    comment_id, user_id
                 )
                 # Remove points from comment owner
                 points_change = POINTS_PER_DISLIKE_RECEIVED if reaction_type == "dislike" else POINTS_PER_LIKE_RECEIVED
-                await update_user_points(conn, comment_owner_id, -points_change)
+                await update_user_points(comment_owner_id, -points_change)
             else:
                 # Change reaction type
                 # First remove old points
                 old_points = POINTS_PER_DISLIKE_RECEIVED if existing_reaction['reaction_type'] == "dislike" else POINTS_PER_LIKE_RECEIVED
-                await update_user_points(conn, comment_owner_id, -old_points)
+                await update_user_points(comment_owner_id, -old_points)
                 
                 # Update reaction
-                await conn.execute("""
-                    UPDATE reactions SET reaction_type = ? WHERE comment_id = ? AND user_id = ?
-                """, (reaction_type, comment_id, user_id))
+                await execute_update("""
+                    UPDATE reactions SET reaction_type = $1 WHERE comment_id = $2 AND user_id = $3
+                """, reaction_type, comment_id, user_id)
                 
                 # Add new points
                 new_points = POINTS_PER_DISLIKE_RECEIVED if reaction_type == "dislike" else POINTS_PER_LIKE_RECEIVED
-                await update_user_points(conn, comment_owner_id, new_points)
+                await update_user_points(comment_owner_id, new_points)
         else:
             # Add new reaction
-            await conn.execute("""
-                INSERT INTO reactions (comment_id, user_id, reaction_type) VALUES (?, ?, ?)
-            """, (comment_id, user_id, reaction_type))
+            await execute_update("""
+                INSERT INTO reactions (comment_id, user_id, reaction_type) VALUES ($1, $2, $3)
+            """, comment_id, user_id, reaction_type)
             
             # Add points to comment owner
             points_change = POINTS_PER_DISLIKE_RECEIVED if reaction_type == "dislike" else POINTS_PER_LIKE_RECEIVED
-            await update_user_points(conn, comment_owner_id, points_change)
-        
-        await conn.commit()
+            await update_user_points(comment_owner_id, points_change)
         
         # Update the message with new reaction counts
         likes, dislikes = await get_comment_reactions(comment_id)
@@ -2534,10 +2328,8 @@ async def noop_handler(callback_query: types.CallbackQuery):
 async def start_confession(message: types.Message, state: FSMContext):
     # Check if user has accepted rules first
     user_id = message.from_user.id
-    conn = db
-    async with conn.execute("SELECT has_accepted_rules FROM user_status WHERE user_id = ?", (user_id,)) as cursor:
-        has_accepted_row = await cursor.fetchone()
-        has_accepted = has_accepted_row['has_accepted_rules'] if has_accepted_row else 0
+    has_accepted_row = await fetch_one("SELECT has_accepted_rules FROM user_status WHERE user_id = $1", user_id)
+    has_accepted = has_accepted_row['has_accepted_rules'] if has_accepted_row else 0
     
     if not has_accepted:
         await message.answer("⚠️ Please use /start first to accept the rules before submitting confessions.")
@@ -2658,18 +2450,17 @@ async def process_confession(message: types.Message, state: FSMContext, text: st
         return
     
     try:
-        conn = db
-        async with conn.execute("""
+        # Insert confession
+        conf_id = await execute_insert_return_id("""
             INSERT INTO confessions (text, user_id, categories, status, photo_file_id) 
-            VALUES (?, ?, ?, 'pending', ?)
-        """, (text, user_id, ",".join(selected_categories), photo_file_id)) as cursor:
-            conf_id = cursor.lastrowid
+            VALUES ($1, $2, $3, 'pending', $4)
+        """, text, user_id, ",".join(selected_categories), photo_file_id)
         
         if not conf_id:
             raise Exception("Failed to get confession ID")
         
-        await update_user_points(conn, user_id, POINTS_PER_CONFESSION)
-        await conn.commit()
+        # Update user points
+        await update_user_points(user_id, POINTS_PER_CONFESSION)
         
         # Prepare confession preview for admin
         category_tags = " ".join([f"#{html.quote(cat)}" for cat in selected_categories])
@@ -2684,7 +2475,6 @@ async def process_confession(message: types.Message, state: FSMContext, text: st
                 f"<b>Caption:</b>\n{html.quote(text)}"
             )
             
-            # Create admin keyboard
             admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{conf_id}"),
                  InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_{conf_id}")]
@@ -2749,7 +2539,7 @@ async def process_confession(message: types.Message, state: FSMContext, text: st
         await state.clear()
 
 # --- Admin Action Handlers ---
-@dp.callback_query(lambda c: c.data.startswith(("approve_", "reject_")) and len(c.data.split("_")) == 2 and c.data.split("_")[1].isdigit())
+@dp.callback_query(F.data.startswith("approve_"))
 async def admin_action(callback_query: types.CallbackQuery, state: FSMContext):
     if not await is_admin(callback_query.from_user.id):
         await callback_query.answer("Unauthorized.", show_alert=True)
@@ -2758,9 +2548,8 @@ async def admin_action(callback_query: types.CallbackQuery, state: FSMContext):
     action, conf_id_str = callback_query.data.split("_", 1)
     conf_id = int(conf_id_str)
     
-    conn = db
-    async with conn.execute("SELECT id, text, user_id, categories, status, photo_file_id FROM confessions WHERE id = ?", (conf_id,)) as cursor:
-        conf = await cursor.fetchone()
+    # Use fetch_one helper
+    conf = await fetch_one("SELECT id, text, user_id, categories, status, photo_file_id FROM confessions WHERE id = $1", conf_id)
     
     if not conf:
         await callback_query.answer("Confession not found.", show_alert=True)
@@ -2795,8 +2584,7 @@ async def admin_action(callback_query: types.CallbackQuery, state: FSMContext):
                 msg = await bot.send_message(CHANNEL_ID, channel_post_text, reply_markup=channel_kbd)
             
             # Update database
-            await conn.execute("UPDATE confessions SET status = 'approved', message_id = ? WHERE id = ?", (msg.message_id, conf_id))
-            await conn.commit()
+            await execute_update("UPDATE confessions SET status = 'approved', message_id = $1 WHERE id = $2", msg.message_id, conf_id)
             
             # Notify user
             await safe_send_message(conf['user_id'], f"✅ Your confession (#{conf_id}) has been approved and posted!")
@@ -2863,20 +2651,16 @@ async def receive_rejection_reason(message: types.Message, state: FSMContext):
     if reason.lower() == "/skip":
         reason = "No reason provided"
     
-    conn = db
     try:
         # Update confession with rejection
-        await conn.execute("""
+        await execute_update("""
             UPDATE confessions 
-            SET status = 'rejected', rejection_reason = ? 
-            WHERE id = ?
-        """, (reason, conf_id))
-        
-        await conn.commit()
+            SET status = 'rejected', rejection_reason = $1 
+            WHERE id = $2
+        """, reason, conf_id)
         
         # Notify user
-        async with conn.execute("SELECT user_id FROM confessions WHERE id = ?", (conf_id,)) as cursor:
-            conf_data = await cursor.fetchone()
+        conf_data = await fetch_one("SELECT user_id FROM confessions WHERE id = $1", conf_id)
         
         if conf_data:
             await safe_send_message(
@@ -2906,6 +2690,108 @@ async def receive_rejection_reason(message: types.Message, state: FSMContext):
     
     finally:
         await state.clear()
+
+@dp.callback_query(F.data.startswith("admin_approve_delete_"))
+async def admin_approve_delete(callback_query: types.CallbackQuery):
+    """Admin approve deletion request"""
+    if not await is_admin(callback_query.from_user.id):
+        await callback_query.answer("Unauthorized.", show_alert=True)
+        return
+    
+    try:
+        conf_id = int(callback_query.data.split("_")[-1])
+    except ValueError:
+        await callback_query.answer("Invalid confession ID.", show_alert=True)
+        return
+    
+    try:
+        # Get confession info
+        conf_data = await fetch_one("SELECT user_id, message_id FROM confessions WHERE id = $1", conf_id)
+        
+        if not conf_data:
+            await callback_query.answer("Confession not found.", show_alert=True)
+            return
+        
+        # Delete from channel if posted
+        if CHANNEL_ID and conf_data['message_id']:
+            try:
+                await bot.delete_message(CHANNEL_ID, conf_data['message_id'])
+            except Exception as e:
+                logger.warning(f"Could not delete message from channel: {e}")
+        
+        # Update confession status
+        await execute_update("UPDATE confessions SET status = 'deleted' WHERE id = $1", conf_id)
+        
+        # Update deletion request
+        await execute_update("""
+            UPDATE deletion_requests 
+            SET status = 'approved', reviewed_at = NOW() 
+            WHERE confession_id = $1
+        """, conf_id)
+        
+        # Notify user
+        await safe_send_message(
+            conf_data['user_id'],
+            f"🗑️ <b>Your deletion request for Confession #{conf_id} has been approved.</b>\n\n"
+            f"<i>The confession has been permanently deleted.</i>"
+        )
+        
+        await callback_query.message.edit_text(
+            f"✅ <b>Deletion Approved</b>\n\n"
+            f"Confession #{conf_id} has been deleted.",
+            reply_markup=None
+        )
+        await callback_query.answer("Deletion approved!")
+        
+    except Exception as e:
+        logger.error(f"Error approving deletion for confession {conf_id}: {e}")
+        await callback_query.answer("Error approving deletion.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("admin_reject_delete_"))
+async def admin_reject_delete(callback_query: types.CallbackQuery):
+    """Admin reject deletion request"""
+    if not await is_admin(callback_query.from_user.id):
+        await callback_query.answer("Unauthorized.", show_alert=True)
+        return
+    
+    try:
+        conf_id = int(callback_query.data.split("_")[-1])
+    except ValueError:
+        await callback_query.answer("Invalid confession ID.", show_alert=True)
+        return
+    
+    try:
+        # Get confession owner
+        conf_data = await fetch_one("SELECT user_id FROM confessions WHERE id = $1", conf_id)
+        
+        if not conf_data:
+            await callback_query.answer("Confession not found.", show_alert=True)
+            return
+        
+        # Update deletion request
+        await execute_update("""
+            UPDATE deletion_requests 
+            SET status = 'rejected', reviewed_at = NOW() 
+            WHERE confession_id = $1
+        """, conf_id)
+        
+        # Notify user
+        await safe_send_message(
+            conf_data['user_id'],
+            f"❌ <b>Your deletion request for Confession #{conf_id} has been rejected.</b>\n\n"
+            f"<i>The confession will remain visible.</i>"
+        )
+        
+        await callback_query.message.edit_text(
+            f"❌ <b>Deletion Rejected</b>\n\n"
+            f"Confession #{conf_id} will remain visible.",
+            reply_markup=None
+        )
+        await callback_query.answer("Deletion rejected!")
+        
+    except Exception as e:
+        logger.error(f"Error rejecting deletion for confession {conf_id}: {e}")
+        await callback_query.answer("Error rejecting deletion.", show_alert=True)
 
 # --- Broadcast Command for Admin ---
 @dp.message(Command("broadcast"))
@@ -2980,10 +2866,8 @@ async def confirm_broadcast(callback_query: types.CallbackQuery, state: FSMConte
         return
     
     # Get all user IDs from user_status table
-    conn = db
     try:
-        async with conn.execute("SELECT DISTINCT user_id FROM user_status WHERE has_accepted_rules = 1 AND is_blocked = 0") as cursor:
-            user_rows = await cursor.fetchall()
+        user_rows = await execute_query("SELECT DISTINCT user_id FROM user_status WHERE has_accepted_rules = 1 AND is_blocked = 0")
         
         total_users = len(user_rows)
         successful = 0
@@ -3096,53 +2980,36 @@ async def show_stats(message: types.Message):
         await message.answer("This command is for admins only.")
         return
     
-    conn = db
     try:
         # Get various stats
-        async with conn.execute("SELECT COUNT(*) FROM confessions") as cursor:
-            total_confessions = (await cursor.fetchone())[0]
-        
-        async with conn.execute("SELECT COUNT(*) FROM confessions WHERE status = 'approved'") as cursor:
-            approved_confessions = (await cursor.fetchone())[0]
-        
-        async with conn.execute("SELECT COUNT(*) FROM confessions WHERE status = 'pending'") as cursor:
-            pending_confessions = (await cursor.fetchone())[0]
-        
-        async with conn.execute("SELECT COUNT(*) FROM comments") as cursor:
-            total_comments = (await cursor.fetchone())[0]
-        
-        async with conn.execute("SELECT COUNT(*) FROM user_status WHERE has_accepted_rules = 1") as cursor:
-            total_users = (await cursor.fetchone())[0]
-        
-        async with conn.execute("SELECT COUNT(*) FROM user_status WHERE is_blocked = 1") as cursor:
-            blocked_users = (await cursor.fetchone())[0]
-        
-        async with conn.execute("SELECT COUNT(*) FROM active_chats WHERE is_active = 1") as cursor:
-            active_chats = (await cursor.fetchone())[0]
+        total_confessions = await fetch_one("SELECT COUNT(*) FROM confessions")
+        approved_confessions = await fetch_one("SELECT COUNT(*) FROM confessions WHERE status = 'approved'")
+        pending_confessions = await fetch_one("SELECT COUNT(*) FROM confessions WHERE status = 'pending'")
+        total_comments = await fetch_one("SELECT COUNT(*) FROM comments")
+        total_users = await fetch_one("SELECT COUNT(*) FROM user_status WHERE has_accepted_rules = 1")
+        blocked_users = await fetch_one("SELECT COUNT(*) FROM user_status WHERE is_blocked = 1")
+        active_chats = await fetch_one("SELECT COUNT(*) FROM active_chats WHERE is_active = 1")
         
         # Get recent activity
         today = datetime.now().strftime('%Y-%m-%d')
-        async with conn.execute("SELECT COUNT(*) FROM confessions WHERE DATE(created_at) = ?", (today,)) as cursor:
-            confessions_today = (await cursor.fetchone())[0]
-        
-        async with conn.execute("SELECT COUNT(*) FROM comments WHERE DATE(created_at) = ?", (today,)) as cursor:
-            comments_today = (await cursor.fetchone())[0]
+        confessions_today = await fetch_one("SELECT COUNT(*) FROM confessions WHERE DATE(created_at) = $1", today)
+        comments_today = await fetch_one("SELECT COUNT(*) FROM comments WHERE DATE(created_at) = $1", today)
         
         stats_text = (
             f"📊 <b>Bot Statistics</b>\n\n"
             f"<b>Users:</b>\n"
-            f"• Total users: {total_users}\n"
-            f"• Blocked users: {blocked_users}\n\n"
+            f"• Total users: {total_users['count'] if total_users else 0}\n"
+            f"• Blocked users: {blocked_users['count'] if blocked_users else 0}\n\n"
             f"<b>Confessions:</b>\n"
-            f"• Total: {total_confessions}\n"
-            f"• Approved: {approved_confessions}\n"
-            f"• Pending: {pending_confessions}\n"
-            f"• Today: {confessions_today}\n\n"
+            f"• Total: {total_confessions['count'] if total_confessions else 0}\n"
+            f"• Approved: {approved_confessions['count'] if approved_confessions else 0}\n"
+            f"• Pending: {pending_confessions['count'] if pending_confessions else 0}\n"
+            f"• Today: {confessions_today['count'] if confessions_today else 0}\n\n"
             f"<b>Comments:</b>\n"
-            f"• Total: {total_comments}\n"
-            f"• Today: {comments_today}\n\n"
+            f"• Total: {total_comments['count'] if total_comments else 0}\n"
+            f"• Today: {comments_today['count'] if comments_today else 0}\n\n"
             f"<b>Chats:</b>\n"
-            f"• Active chats: {active_chats}\n\n"
+            f"• Active chats: {active_chats['count'] if active_chats else 0}\n\n"
             f"<i>Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>"
         )
         
@@ -3353,26 +3220,23 @@ async def receive_block_reason(message: types.Message, state: FSMContext):
     if reason == "/skip":
         reason = "No reason provided"
     
-    conn = db
     try:
         if permanent:
             # Permanent block
             blocked_until = None
-            await conn.execute("""
+            await execute_update("""
                 UPDATE user_status 
-                SET is_blocked = 1, blocked_until = NULL, block_reason = ?
-                WHERE user_id = ?
-            """, (reason, target_user_id))
+                SET is_blocked = 1, blocked_until = NULL, block_reason = $1
+                WHERE user_id = $2
+            """, reason, target_user_id)
         else:
             # Temporary block
             blocked_until = datetime.now() + block_duration
-            await conn.execute("""
+            await execute_update("""
                 UPDATE user_status 
-                SET is_blocked = 1, blocked_until = ?, block_reason = ?
-                WHERE user_id = ?
-            """, (blocked_until.isoformat(), reason, target_user_id))
-        
-        await conn.commit()
+                SET is_blocked = 1, blocked_until = $1, block_reason = $2
+                WHERE user_id = $3
+            """, blocked_until, reason, target_user_id)
         
         # Notify user
         try:
@@ -3435,24 +3299,20 @@ async def unblock_user(message: types.Message):
     target_user_id = message.reply_to_message.from_user.id
     target_name = message.reply_to_message.from_user.full_name
     
-    conn = db
     try:
         # Check if user is actually blocked
-        async with conn.execute("SELECT is_blocked FROM user_status WHERE user_id = ?", (target_user_id,)) as cursor:
-            status = await cursor.fetchone()
+        status = await fetch_one("SELECT is_blocked FROM user_status WHERE user_id = $1", target_user_id)
         
         if not status or not status['is_blocked']:
             await message.answer(f"User {target_name} is not blocked.")
             return
         
         # Unblock user
-        await conn.execute("""
+        await execute_update("""
             UPDATE user_status 
             SET is_blocked = 0, blocked_until = NULL, block_reason = NULL
-            WHERE user_id = ?
-        """, (target_user_id,))
-        
-        await conn.commit()
+            WHERE user_id = $1
+        """, target_user_id)
         
         # Notify user
         try:
@@ -3595,10 +3455,8 @@ async def start(message: types.Message, state: FSMContext, command: Optional[Com
     user_id = message.from_user.id
 
     # Check if user has accepted rules
-    conn = db
-    async with conn.execute("SELECT has_accepted_rules FROM user_status WHERE user_id = ?", (user_id,)) as cursor:
-        has_accepted_row = await cursor.fetchone()
-        has_accepted = has_accepted_row['has_accepted_rules'] if has_accepted_row else 0
+    has_accepted_row = await fetch_one("SELECT has_accepted_rules FROM user_status WHERE user_id = $1", user_id)
+    has_accepted = has_accepted_row['has_accepted_rules'] if has_accepted_row else 0
 
     if not has_accepted:
         rules_text = (
@@ -3624,19 +3482,17 @@ async def start(message: types.Message, state: FSMContext, command: Optional[Com
             try:
                 conf_id = int(deep_link_args.split("_", 1)[1])
                 logger.info(f"User {user_id} started via deep link for conf {conf_id}")
-                conn = db
-                async with conn.execute("""
+                
+                conf_data = await fetch_one("""
                     SELECT c.text, c.categories, c.status, c.user_id, c.photo_file_id, COUNT(com.id) as comment_count 
                     FROM confessions c LEFT JOIN comments com ON c.id = com.confession_id
-                    WHERE c.id = ? GROUP BY c.id
-                """, (conf_id,)) as cursor:
-                    conf_data = await cursor.fetchall()
+                    WHERE c.id = $1 GROUP BY c.id
+                """, conf_id)
                 
-                if not conf_data or conf_data[0]['status'] != 'approved':
+                if not conf_data or conf_data['status'] != 'approved':
                     await message.answer(f"Confession #{conf_id} not found or not approved.")
                     return
                 
-                conf_data = conf_data[0]
                 comm_count = conf_data['comment_count']
                 categories = conf_data['categories'] or ""
                 category_tags = " ".join([f"#{html.quote(cat)}" for cat in categories.split(",")]) if categories else "#Unknown"
@@ -3719,12 +3575,11 @@ async def start(message: types.Message, state: FSMContext, command: Optional[Com
 @dp.callback_query(F.data == "accept_rules")
 async def handle_accept_rules(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
-    conn = db
-    await conn.execute(
-        """INSERT OR REPLACE INTO user_status (user_id, has_accepted_rules) VALUES (?, 1)""",
-        (user_id,)
+    await execute_update(
+        """INSERT INTO user_status (user_id, has_accepted_rules) VALUES ($1, 1) 
+           ON CONFLICT (user_id) DO UPDATE SET has_accepted_rules = 1""",
+        user_id
     )
-    await conn.commit()
     
     await callback_query.message.edit_text(
         "✅ <b>Rules Accepted!</b>\n\n"
@@ -3739,7 +3594,91 @@ async def handle_accept_rules(callback_query: types.CallbackQuery):
     )
     await callback_query.answer("Rules accepted!")
 
-# --- Koyeb Specific: Main Execution with HTTP Server ---
+# --- Health Check Handler for Koyeb ---
+async def health_check_handler(request):
+    """Enhanced health check for Koyeb"""
+    try:
+        # Check bot
+        bot_status = await bot.get_me()
+        
+        # Check database
+        async with db_pool.acquire() as conn:
+            db_status = await conn.fetchval('SELECT 1')
+        
+        # Check basic functionality
+        status = {
+            "status": "healthy",
+            "bot": f"@{bot_status.username}",
+            "database": "connected",
+            "timestamp": datetime.now().isoformat(),
+            "version": "1.0.0"
+        }
+        
+        return web.json_response(status)
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return web.json_response(
+            {"status": "unhealthy", "error": str(e)},
+            status=500
+        )
+
+async def start_http_server():
+    """Start HTTP server for health checks"""
+    try:
+        app = web.Application()
+        app.router.add_get('/', health_check_handler)
+        app.router.add_get('/health', health_check_handler)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', HTTP_PORT)
+        await site.start()
+        logger.info(f"✅ HTTP server started on port {HTTP_PORT}")
+        
+        # Keep server running
+        while True:
+            await asyncio.sleep(3600)
+    except Exception as e:
+        logger.error(f"Failed to start HTTP server: {e}")
+
+async def set_bot_commands():
+    """Set bot commands for users and admins"""
+    user_commands = [
+        types.BotCommand(command="start", description="Start/View confession"),
+        types.BotCommand(command="confess", description="Submit anonymous confession"),
+        types.BotCommand(command="profile", description="View and manage your profile"),
+        types.BotCommand(command="help", description="Show help and commands"),
+        types.BotCommand(command="rules", description="View the bot's rules"),
+        types.BotCommand(command="privacy", description="View privacy information"),
+        types.BotCommand(command="cancel", description="Cancel current action"),
+        types.BotCommand(command="endchat", description="End current chat"),
+    ]
+    
+    admin_commands = user_commands + [
+        types.BotCommand(command="admin", description="Admin panel"),
+        types.BotCommand(command="id", description="Get user info"),
+        types.BotCommand(command="warn", description="Warn a user"),
+        types.BotCommand(command="block", description="Temporarily block a user"),
+        types.BotCommand(command="pblock", description="Permanently block a user"),
+        types.BotCommand(command="unblock", description="Unblock a user"),
+        types.BotCommand(command="stats", description="Show bot statistics"),
+        types.BotCommand(command="broadcast", description="Broadcast message to all users"),
+    ]
+    
+    # Set commands for all users
+    await bot.set_my_commands(user_commands)
+    
+    # Set admin commands for admin users
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.set_my_commands(
+                admin_commands, 
+                scope=types.BotCommandScopeChat(chat_id=admin_id)
+            )
+        except Exception as e:
+            logger.warning(f"Could not set admin commands for {admin_id}: {e}")
+
+# --- Main Function ---
 async def main():
     try:
         # Clear webhook at the start
@@ -3754,119 +3693,63 @@ async def main():
         hostname = socket.gethostname()
         pid = os.getpid()
         logger.info(f"🚀 Bot starting on host: {hostname}, PID: {pid}")
-        logger.info(f"🔧 Environment: PORT={HTTP_PORT}, Admins: {len(ADMIN_IDS)}")
-        logger.info(f"📁 Database path: {DATABASE_PATH}")
+        logger.info(f"🔧 Environment: PORT={HTTP_PORT}, Database: PostgreSQL")
         
+        # Setup database and bot
         await setup()
-        if not db or not bot_info:
-            logger.critical("FATAL: Database or bot info missing after setup. Cannot start.")
+        
+        # Verify setup
+        if not db_pool:
+            logger.critical("PostgreSQL pool not initialized")
+            return
+        
+        if not bot_info:
+            logger.critical("Bot info not available")
             return
 
         # Register middleware
         dp.message.middleware(BlockUserMiddleware())
         dp.callback_query.middleware(BlockUserMiddleware())
 
-        # Set commands for regular users
-        user_commands = [
-            types.BotCommand(command="start", description="Start/View confession"),
-            types.BotCommand(command="confess", description="Submit anonymous confession (text or photo)"),
-            types.BotCommand(command="profile", description="View and manage your profile"),
-            types.BotCommand(command="help", description="Show help and commands"),
-            types.BotCommand(command="rules", description="View the bot's rules"),
-            types.BotCommand(command="privacy", description="View privacy information"),
-            types.BotCommand(command="cancel", description="Cancel current action"),
-            types.BotCommand(command="endchat", description="End current chat"),
-        ]
-        
-        # Set admin commands for admin users
-        admin_commands = user_commands + [
-            types.BotCommand(command="admin", description="Admin panel"),
-            types.BotCommand(command="id", description="Get user info"),
-            types.BotCommand(command="warn", description="Warn a user"),
-            types.BotCommand(command="block", description="Temporarily block a user"),
-            types.BotCommand(command="pblock", description="Permanently block a user"),
-            types.BotCommand(command="unblock", description="Unblock a user"),
-            types.BotCommand(command="stats", description="Show bot statistics"),
-            types.BotCommand(command="broadcast", description="Broadcast message to all users"),
-        ]
-        
-        # Set commands for all users
-        await bot.set_my_commands(user_commands)
-        
-        # Set admin commands for admin users
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.set_my_commands(
-                    admin_commands, 
-                    scope=types.BotCommandScopeChat(chat_id=admin_id)
-                )
-            except Exception as e:
-                logger.warning(f"Could not set admin commands for {admin_id}: {e}")
+        # Set commands
+        await set_bot_commands()
 
-        logger.info("Starting bot...")
+        logger.info("Starting bot polling...")
         
-        # --- Koyeb Specific: Start HTTP server for health checks ---
-        async def health_check_handler(request):
-            """Handle health check requests"""
-            try:
-                # Check if bot is responsive
-                await bot.get_me()
-                return web.Response(text="Bot is running", status=200)
-            except Exception as e:
-                logger.error(f"Health check failed: {e}")
-                return web.Response(text=f"Bot error: {e}", status=500)
-        
-        async def start_http_server():
-            """Start HTTP server for Koyeb health checks"""
-            try:
-                app = web.Application()
-                app.router.add_get('/', health_check_handler)
-                app.router.add_get('/health', health_check_handler)
-                
-                runner = web.AppRunner(app)
-                await runner.setup()
-                site = web.TCPSite(runner, '0.0.0.0', HTTP_PORT)
-                await site.start()
-                logger.info(f"✅ HTTP server started on port {HTTP_PORT}")
-                
-                # Keep server running
-                while True:
-                    await asyncio.sleep(3600)
-            except Exception as e:
-                logger.error(f"Failed to start HTTP server: {e}")
-                raise
-        
-        # Start HTTP server in background
+        # Start HTTP server for health checks
         asyncio.create_task(start_http_server())
         
-        # Log all registered handlers for debugging
-        logger.info(f"Registered message handlers: {len(dp.message.handlers)}")
-        logger.info(f"Registered callback handlers: {len(dp.callback_query.handlers)}")
-        
-        # Start polling with error handling for Koyeb
-        logger.info("🚀 Starting bot polling...")
+        # Start polling
         await dp.start_polling(
             bot, 
             skip_updates=True, 
             allowed_updates=dp.resolve_used_update_types(),
-            handle_signals=False  # Important for Koyeb to handle signals properly
+            handle_signals=False
         )
         
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
-        # Sleep before exit to allow logs to be written
         await asyncio.sleep(2)
         raise
     finally:
         logger.info("Shutting down...")
         if bot and bot.session:
             await bot.session.close()
-        if db:
-            await db.close()
+        if db_pool:
+            await db_pool.close()
         logger.info("Bot stopped.")
 
+async def shutdown_bot():
+    """Clean shutdown"""
+    logger.info("Shutting down...")
+    if bot and hasattr(bot, 'session'):
+        await bot.session.close()
+    if db_pool:
+        await db_pool.close()
+    logger.info("Bot stopped.")
+
 if __name__ == "__main__":
-    # Simple startup for Koyeb
+    # Simple startup
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
