@@ -157,78 +157,50 @@ async def execute_query(query: str, *params):
     """Execute query and return results"""
     try:
         if not db_pool:
-            raise Exception("PostgreSQL pool not initialized. Call setup() first.")
+            raise Exception("PostgreSQL pool not initialized")
         
         async with db_pool.acquire() as conn:
-            # Convert SQLite ? placeholders to PostgreSQL $1, $2, etc.
-            converted_query = query
-            param_count = len(params)
-            for i in range(param_count, 0, -1):
-                converted_query = converted_query.replace('?', f'${i}', 1)
-            return await conn.fetch(converted_query, *params)
+            return await conn.fetch(query, *params)
     except Exception as e:
-        logger.error(f"Error in execute_query: {e}\nQuery: {query}\nParams: {params}")
+        logger.error(f"Error in execute_query: {e}")
         raise
 
 async def fetch_one(query: str, *params):
     """Fetch single row"""
     try:
         if not db_pool:
-            raise Exception("PostgreSQL pool not initialized. Call setup() first.")
+            raise Exception("PostgreSQL pool not initialized")
         
         async with db_pool.acquire() as conn:
-            # Convert placeholders
-            converted_query = query
-            param_count = len(params)
-            for i in range(param_count, 0, -1):
-                converted_query = converted_query.replace('?', f'${i}', 1)
-            row = await conn.fetchrow(converted_query, *params)
-            return row
+            return await conn.fetchrow(query, *params)
     except Exception as e:
-        logger.error(f"Error in fetch_one: {e}\nQuery: {query}\nParams: {params}")
+        logger.error(f"Error in fetch_one: {e}")
         raise
 
 async def execute_update(query: str, *params):
     """Execute INSERT/UPDATE/DELETE query"""
     try:
         if not db_pool:
-            raise Exception("PostgreSQL pool not initialized. Call setup() first.")
+            raise Exception("PostgreSQL pool not initialized")
         
         async with db_pool.acquire() as conn:
-            # Convert placeholders
-            converted_query = query
-            param_count = len(params)
-            for i in range(param_count, 0, -1):
-                converted_query = converted_query.replace('?', f'${i}', 1)
-            result = await conn.execute(converted_query, *params)
-            return result
+            return await conn.execute(query, *params)
     except Exception as e:
-        logger.error(f"Error in execute_update: {e}\nQuery: {query}\nParams: {params}")
+        logger.error(f"Error in execute_update: {e}")
         raise
 
 async def execute_insert_return_id(query: str, *params):
     """Execute INSERT and return inserted ID"""
     try:
         if not db_pool:
-            raise Exception("PostgreSQL pool not initialized. Call setup() first.")
+            raise Exception("PostgreSQL pool not initialized")
         
         async with db_pool.acquire() as conn:
-            # Convert placeholders
-            converted_query = query
-            param_count = len(params)
-            for i in range(param_count, 0, -1):
-                converted_query = converted_query.replace('?', f'${i}', 1)
-            
-            # Ensure RETURNING clause exists for PostgreSQL
-            if 'RETURNING' not in converted_query.upper():
-                # If it's an INSERT without RETURNING, add it
-                if converted_query.upper().startswith('INSERT'):
-                    # Extract table name and add RETURNING id
-                    converted_query = converted_query.rstrip(';') + ' RETURNING id;'
-            
-            return await conn.fetchval(converted_query, *params)
+            # For PostgreSQL with SERIAL or BIGSERIAL
+            query = query.rstrip(';') + ' RETURNING id;'
+            return await conn.fetchval(query, *params)
     except Exception as e:
-        logger.error(f"Error in execute_insert_return_id: {e}\nQuery: {query}\nParams: {params}")
+        logger.error(f"Error in execute_insert_return_id: {e}")
         raise
 
 # --- Helper Functions for Profile Links ---
