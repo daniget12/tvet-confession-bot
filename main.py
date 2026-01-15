@@ -193,16 +193,25 @@ async def execute_insert_return_id(query: str, *params):
     """Execute INSERT and return inserted ID"""
     try:
         if not db_pool:
-            raise Exception("PostgreSQL pool not initialized")
+            raise Exception("PostgreSQL pool not initialized.")
         
         async with db_pool.acquire() as conn:
-            # For PostgreSQL with SERIAL or BIGSERIAL
-            query = query.rstrip(';') + ' RETURNING id;'
-            return await conn.fetchval(query, *params)
+            # If query uses ? placeholders, convert them to $1, $2, etc.
+            if '?' in query:
+                # Convert SQLite ? placeholders to PostgreSQL $1, $2, etc.
+                converted_query = query
+                param_count = len(params)
+                for i in range(param_count, 0, -1):
+                    converted_query = converted_query.replace('?', f'${i}', 1)
+            else:
+                # Query already uses PostgreSQL placeholders
+                converted_query = query
+            
+            logger.debug(f"Executing insert query: {converted_query}")
+            return await conn.fetchval(converted_query, *params)
     except Exception as e:
-        logger.error(f"Error in execute_insert_return_id: {e}")
+        logger.error(f"Error in execute_insert_return_id: {e}\nQuery: {query}\nParams: {params}")
         raise
-
 # --- Helper Functions for Profile Links ---
 def encode_user_id(user_id: int) -> str:
     """Encode user ID to a short, non-reversible string"""
