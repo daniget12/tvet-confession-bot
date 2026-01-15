@@ -122,6 +122,8 @@ bot_info = None
 
 # --- PostgreSQL Connection Pool ---
 db_pool = None
+db_connection_retries = 0
+MAX_DB_RETRIES = 5
 
 # --- FSM States ---
 class ConfessionForm(StatesGroup):
@@ -153,11 +155,45 @@ class BlockForm(StatesGroup):
     waiting_for_block_reason = State()
 
 # --- Database Helper Functions for PostgreSQL ---
+async def ensure_db_connection():
+    """Ensure database connection is active, reconnect if needed"""
+    global db_pool, db_connection_retries
+    
+    if db_pool is None:
+        logger.warning("Database pool is None, attempting to reconnect...")
+        await create_db_pool()
+        return True
+    
+    try:
+        # Test connection
+        async with db_pool.acquire() as conn:
+            await conn.fetchval('SELECT 1')
+        db_connection_retries = 0
+        return True
+    except Exception as e:
+        db_connection_retries += 1
+        logger.error(f"Database connection lost (attempt {db_connection_retries}/{MAX_DB_RETRIES}): {e}")
+        
+        if db_connection_retries <= MAX_DB_RETRIES:
+            try:
+                await db_pool.close()
+            except:
+                pass
+            
+            try:
+                await create_db_pool()
+                logger.info("Database connection reestablished")
+                return True
+            except Exception as reconnect_error:
+                logger.error(f"Failed to reconnect to database: {reconnect_error}")
+        
+        return False
+
 async def execute_query(query: str, *params):
     """Execute query and return results"""
     try:
-        if not db_pool:
-            raise Exception("PostgreSQL pool not initialized")
+        if not await ensure_db_connection():
+            raise Exception("Failed to establish database connection")
         
         async with db_pool.acquire() as conn:
             return await conn.fetch(query, *params)
@@ -168,8 +204,8 @@ async def execute_query(query: str, *params):
 async def fetch_one(query: str, *params):
     """Fetch single row"""
     try:
-        if not db_pool:
-            raise Exception("PostgreSQL pool not initialized")
+        if not await ensure_db_connection():
+            raise Exception("Failed to establish database connection")
         
         async with db_pool.acquire() as conn:
             return await conn.fetchrow(query, *params)
@@ -180,8 +216,8 @@ async def fetch_one(query: str, *params):
 async def execute_update(query: str, *params):
     """Execute INSERT/UPDATE/DELETE query"""
     try:
-        if not db_pool:
-            raise Exception("PostgreSQL pool not initialized")
+        if not await ensure_db_connection():
+            raise Exception("Failed to establish database connection")
         
         async with db_pool.acquire() as conn:
             return await conn.execute(query, *params)
@@ -190,28 +226,32 @@ async def execute_update(query: str, *params):
         raise
 
 async def execute_insert_return_id(query: str, *params):
-    """Execute INSERT and return inserted ID"""
+    """Execute INSERT and return inserted ID - FIXED VERSION"""
     try:
-        if not db_pool:
-            raise Exception("PostgreSQL pool not initialized.")
+        if not await ensure_db_connection():
+            raise Exception("Failed to establish database connection")
         
         async with db_pool.acquire() as conn:
-            # If query uses ? placeholders, convert them to $1, $2, etc.
-            if '?' in query:
-                # Convert SQLite ? placeholders to PostgreSQL $1, $2, etc.
-                converted_query = query
-                param_count = len(params)
-                for i in range(param_count, 0, -1):
-                    converted_query = converted_query.replace('?', f'${i}', 1)
-            else:
-                # Query already uses PostgreSQL placeholders
-                converted_query = query
+            # Ensure query has RETURNING clause
+            if 'RETURNING' not in query.upper():
+                # Add RETURNING clause if not present
+                if 'INSERT' in query.upper():
+                    # Find the table name and primary key
+                    query = query.rstrip(';') + ' RETURNING id;'
             
-            logger.debug(f"Executing insert query: {converted_query}")
-            return await conn.fetchval(converted_query, *params)
+            logger.debug(f"Executing insert query: {query[:200]}")
+            result = await conn.fetchval(query, *params)
+            
+            if result is None:
+                # Try to get the last inserted ID
+                result_query = "SELECT LASTVAL();"
+                result = await conn.fetchval(result_query)
+            
+            return result
     except Exception as e:
-        logger.error(f"Error in execute_insert_return_id: {e}\nQuery: {query}\nParams: {params}")
+        logger.error(f"Error in execute_insert_return_id: {e}\nQuery: {query[:200]}\nParams: {params}")
         raise
+
 # --- Helper Functions for Profile Links ---
 def encode_user_id(user_id: int) -> str:
     """Encode user ID to a short, non-reversible string"""
@@ -268,10 +308,15 @@ async def create_db_pool():
         
         db_pool = await asyncpg.create_pool(
             dsn=connection_string,
-            min_size=1,
+            min_size=2,
             max_size=10,
             command_timeout=60,
-            ssl=ssl_mode
+            ssl=ssl_mode,
+            # Connection recycling
+            max_queries=50000,
+            max_inactive_connection_lifetime=300,
+            # Timeout settings
+            timeout=30
         )
         logger.info("✅ PostgreSQL connection pool created")
         return db_pool
@@ -2089,7 +2134,7 @@ async def receive_comment_gif(message: types.Message, state: FSMContext):
 
 async def process_comment(message: types.Message, state: FSMContext, text: Optional[str] = None, 
                          sticker_file_id: Optional[str] = None, animation_file_id: Optional[str] = None):
-    """Process and save comment"""
+    """Process and save comment - FIXED VERSION"""
     user_id = message.from_user.id
     state_data = await state.get_data()
     confession_id = state_data.get('confession_id')
@@ -2110,14 +2155,28 @@ async def process_comment(message: types.Message, state: FSMContext, text: Optio
         return
     
     try:
-        # Insert comment
-        comment_id = await execute_insert_return_id("""
+        # FIXED: Use proper INSERT with RETURNING
+        query = """
             INSERT INTO comments (confession_id, user_id, text, sticker_file_id, animation_file_id, parent_comment_id)
             VALUES ($1, $2, $3, $4, $5, $6)
-        """, confession_id, user_id, text, sticker_file_id, animation_file_id, parent_comment_id)
+            RETURNING id
+        """
+        
+        comment_id = await execute_insert_return_id(query, confession_id, user_id, text, sticker_file_id, animation_file_id, parent_comment_id)
         
         if not comment_id:
-            raise Exception("Failed to get comment ID")
+            # Try alternative approach
+            comment_row = await fetch_one("""
+                SELECT id FROM comments 
+                WHERE confession_id = $1 AND user_id = $2 AND created_at = (
+                    SELECT MAX(created_at) FROM comments WHERE confession_id = $1 AND user_id = $2
+                )
+            """, confession_id, user_id)
+            
+            if comment_row:
+                comment_id = comment_row['id']
+            else:
+                raise Exception("Failed to get comment ID from database")
         
         # Update user points for commenting
         await update_user_points(user_id, 1)
@@ -2417,6 +2476,7 @@ async def receive_photo_confession(message: types.Message, state: FSMContext):
     await process_confession(message, state, text=text, photo_file_id=photo_file_id)
 
 async def process_confession(message: types.Message, state: FSMContext, text: str, photo_file_id: Optional[str] = None):
+    """Process and save confession - FIXED VERSION"""
     user_id = message.from_user.id
     state_data = await state.get_data()
     selected_categories: List[str] = state_data.get("selected_categories", [])
@@ -2435,20 +2495,34 @@ async def process_confession(message: types.Message, state: FSMContext, text: st
         return
     
     try:
-        # FIXED: Use proper PostgreSQL INSERT with RETURNING
-        conf_id = await execute_insert_return_id("""
+        # FIXED: Use proper INSERT with RETURNING
+        query = """
             INSERT INTO confessions (text, user_id, categories, status, photo_file_id) 
             VALUES ($1, $2, $3, 'pending', $4)
             RETURNING id
-        """, text, user_id, ",".join(selected_categories), photo_file_id)
+        """
+        
+        conf_id = await execute_insert_return_id(query, text, user_id, ",".join(selected_categories), photo_file_id)
+        
+        if not conf_id:
+            # Try alternative approach
+            conf_row = await fetch_one("""
+                SELECT id FROM confessions 
+                WHERE user_id = $1 AND created_at = (
+                    SELECT MAX(created_at) FROM confessions WHERE user_id = $1
+                )
+            """, user_id)
+            
+            if conf_row:
+                conf_id = conf_row['id']
+            else:
+                raise Exception("Failed to get confession ID from database")
         
         # Update user points
         await update_user_points(user_id, POINTS_PER_CONFESSION)
         
         # Prepare confession preview for admin
         category_tags = " ".join([f"#{html.quote(cat)}" for cat in selected_categories])
-        
-        # ... rest of the function remains the same
         
         if photo_file_id:
             # Send photo with caption to admin
@@ -2956,7 +3030,6 @@ async def admin_panel(message: types.Message):
     
     await message.answer(admin_text)
 
-@dp.message(Command("stats"))
 @dp.message(Command("stats"))
 async def show_stats(message: types.Message):
     """Show bot statistics"""
@@ -3669,6 +3742,33 @@ async def set_bot_commands():
         except Exception as e:
             logger.warning(f"Could not set admin commands for {admin_id}: {e}")
 
+# --- Database Connection Monitor ---
+async def monitor_database_connection():
+    """Periodically check and maintain database connection"""
+    while True:
+        try:
+            if db_pool:
+                async with db_pool.acquire() as conn:
+                    await conn.fetchval('SELECT 1')
+                logger.debug("Database connection check: OK")
+            else:
+                logger.warning("Database pool is None, attempting to reconnect...")
+                await create_db_pool()
+        except Exception as e:
+            logger.error(f"Database connection monitor error: {e}")
+            try:
+                if db_pool:
+                    await db_pool.close()
+            except:
+                pass
+            try:
+                await create_db_pool()
+                logger.info("Database reconnected by monitor")
+            except Exception as reconnect_error:
+                logger.error(f"Failed to reconnect database: {reconnect_error}")
+        
+        await asyncio.sleep(300)  # Check every 5 minutes
+
 # --- Main Function ---
 async def main():
     try:
@@ -3709,6 +3809,9 @@ async def main():
         
         # Start HTTP server for health checks
         asyncio.create_task(start_http_server())
+        
+        # Start database connection monitor
+        asyncio.create_task(monitor_database_connection())
         
         # Start polling
         await dp.start_polling(
