@@ -1,8 +1,6 @@
 import logging
 import os
 import asyncio
-import aiosqlite
-import sqlite3
 from aiogram import Bot, Dispatcher, types, F, html
 from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command, CommandObject, StateFilter
@@ -35,19 +33,9 @@ from contextlib import suppress
 
 # --- PostgreSQL Database Imports ---
 import asyncpg
-import psycopg2
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+
 
 # --- Koyeb Specific: Prevent Multiple Instances with PID check ---
-if os.environ.get('BOT_IS_RUNNING'):
-    # Check if it's the same process ID to avoid false positives
-    current_pid = str(os.getpid())
-    stored_pid = os.environ.get('BOT_PID')
-    if stored_pid != current_pid:
-        logging.critical(f"Bot restart detected. Old PID: {stored_pid}, New PID: {current_pid}")
-    else:
-        logging.critical("Bot is already running. Exiting...")
-        sys.exit(1)
 
 os.environ['BOT_IS_RUNNING'] = '1'
 os.environ['BOT_PID'] = str(os.getpid())
@@ -160,10 +148,16 @@ async def ensure_db_connection():
     global db_pool, db_connection_retries
     
     if db_pool is None:
-        logger.warning("Database pool is None, attempting to reconnect...")
-        await create_db_pool()
-        return True
+        # Try to create pool if it doesn't exist
+        try:
+            logger.warning("Database pool is None, attempting to create...")
+            await create_db_pool()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to create database pool: {e}")
+            return False
     
+    # Rest of the existing function...
     try:
         # Test connection
         async with db_pool.acquire() as conn:
@@ -171,6 +165,7 @@ async def ensure_db_connection():
         db_connection_retries = 0
         return True
     except Exception as e:
+        # ... rest of your existing code
         db_connection_retries += 1
         logger.error(f"Database connection lost (attempt {db_connection_retries}/{MAX_DB_RETRIES}): {e}")
         
@@ -191,6 +186,10 @@ async def ensure_db_connection():
 
 async def execute_query(query: str, *params):
     """Execute query and return results"""
+    if db_pool is None:
+        logger.error("No database connection available")
+        raise Exception("Database connection not available")
+    
     try:
         if not await ensure_db_connection():
             raise Exception("Failed to establish database connection")
@@ -292,60 +291,125 @@ async def get_user_id_from_encoded(encoded_id: str) -> Optional[int]:
     
     return None
 
+# Update the database connection section in setup()
 async def create_db_pool():
-    """Create PostgreSQL connection pool"""
+    """Create PostgreSQL connection pool for Supabase - FIXED VERSION"""
     global db_pool
     try:
-        # Parse connection string - ensure it starts with postgres://
         connection_string = DATABASE_URL
         
-        # Convert postgresql:// to postgres:// if needed
+        # Handle different connection string formats
+        # Supabase often provides connection strings in this format:
+        # postgresql://postgres:[password]@[host]:5432/postgres
+        
+        # Convert postgresql:// to postgres:// if needed for asyncpg
         if connection_string.startswith('postgresql://'):
             connection_string = connection_string.replace('postgresql://', 'postgres://')
         
-        # For Koyeb, always use SSL
-        ssl_mode = 'require'
+        # For Supabase free tier, SSL is usually required
+        # But we need to handle it differently for asyncpg
+        # Remove any existing sslmode parameter and add our own
+        import urllib.parse
+        
+        # Parse the connection string
+        parsed = urllib.parse.urlparse(connection_string)
+        query_params = urllib.parse.parse_qs(parsed.query)
+        
+        # Remove any existing sslmode
+        query_params.pop('sslmode', None)
+        
+        # Add our sslmode - 'require' for Supabase
+        query_params['sslmode'] = ['require']
+        
+        # Rebuild the connection string
+        netloc = parsed.netloc
+        if '@' in netloc:
+            # Keep the auth part
+            pass
+        
+        new_query = urllib.parse.urlencode(query_params, doseq=True)
+        new_url = urllib.parse.urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            new_query,
+            parsed.fragment
+        ))
+        
+        logger.info(f"Connecting to Supabase database...")
         
         db_pool = await asyncpg.create_pool(
-            dsn=connection_string,
-            min_size=2,
-            max_size=10,
+            dsn=new_url,
+            min_size=1,
+            max_size=3,
             command_timeout=60,
-            ssl=ssl_mode,
-            # Connection recycling
             max_queries=50000,
             max_inactive_connection_lifetime=300,
-            # Timeout settings
             timeout=30
         )
-        logger.info("✅ PostgreSQL connection pool created")
+        logger.info("✅ PostgreSQL (Supabase) connection pool created")
         return db_pool
     except Exception as e:
         logger.error(f"Failed to create PostgreSQL connection: {e}")
-        raise
+        # Try one more time with simpler approach
+        try:
+            logger.info("Trying alternative connection method...")
+            db_pool = await asyncpg.create_pool(
+                dsn=DATABASE_URL,
+                min_size=1,
+                max_size=3,
+                command_timeout=60,
+                ssl='require',
+                max_queries=50000,
+                max_inactive_connection_lifetime=300,
+                timeout=30
+            )
+            logger.info("✅ PostgreSQL connection created (alternative method)")
+            return db_pool
+        except Exception as e2:
+            logger.error(f"Alternative connection also failed: {e2}")
+            raise
 
 async def setup():
     global db_pool, bot_info
     
     try:
-        # Create PostgreSQL connection pool
-        db_pool = await create_db_pool()
-        
-        # Initialize PostgreSQL tables
-        await init_postgres_tables()
-        
-        # Create indexes for performance
-        await create_postgres_indexes()
-        
+        # Get bot info first
         bot_info = await bot.get_me()
-        logger.info(f"Bot started: @{bot_info.username}")
+        logger.info(f"Bot: @{bot_info.username}")
+        
+        # Create PostgreSQL connection pool
+        logger.info(f"Setting up Supabase connection...")
+        try:
+            db_pool = await create_db_pool()
+            
+            # Test connection
+            async with db_pool.acquire() as conn:
+                version = await conn.fetchval('SELECT version()')
+                logger.info(f"Database connection successful: {version[:50]}...")
+            
+            # Initialize PostgreSQL tables
+            await init_postgres_tables()
+            
+            # Create indexes for performance
+            await create_postgres_indexes()
+            
+            logger.info("✅ Database setup complete")
+            
+        except Exception as db_error:
+            logger.error(f"Database setup failed: {db_error}")
+            logger.warning("Bot will run with limited functionality (no database)")
+            db_pool = None  # Set to None so other functions know
+        
+        logger.info(f"✅ Bot started: @{bot_info.username}")
         
     except Exception as e:
-        logger.critical(f"Failed to setup database: {e}")
+        logger.critical(f"Failed to setup: {e}")
         raise
 
 async def init_postgres_tables():
-    """Initialize PostgreSQL tables"""
+    """Initialize PostgreSQL tables with better error handling"""
     try:
         # Confessions Table
         await execute_update("""
@@ -361,6 +425,8 @@ async def init_postgres_tables():
                 categories TEXT
             );
         """)
+        logger.info("✅ PostgreSQL 'confessions' table ready")
+        # ... rest of your table creation code
         logger.info("✅ PostgreSQL 'confessions' table ready")
 
         # Comments Table
@@ -3659,33 +3725,38 @@ async def handle_accept_rules(callback_query: types.CallbackQuery):
     await callback_query.answer("Rules accepted!")
 
 # --- Health Check Handler for Koyeb ---
+# Update health check handler
 async def health_check_handler(request):
-    """Enhanced health check for Koyeb"""
+    """Simple health check for Render"""
     try:
-        # Check bot
-        bot_status = await bot.get_me()
+        # Check bot status
+        if not bot_info:
+            me = await bot.get_me()
+            bot_status = f"@{me.username}"
+        else:
+            bot_status = f"@{bot_info.username}"
         
-        # Check database
-        async with db_pool.acquire() as conn:
-            db_status = await conn.fetchval('SELECT 1')
+        # Check database connection
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                await conn.fetchval('SELECT 1')
+            db_status = "connected"
+        else:
+            db_status = "disconnected"
         
-        # Check basic functionality
-        status = {
+        return web.json_response({
             "status": "healthy",
-            "bot": f"@{bot_status.username}",
-            "database": "connected",
-            "timestamp": datetime.now().isoformat(),
-            "version": "1.0.0"
-        }
-        
-        return web.json_response(status)
+            "service": "confession-bot",
+            "bot": bot_status,
+            "database": db_status,
+            "timestamp": datetime.now().isoformat()
+        })
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         return web.json_response(
             {"status": "unhealthy", "error": str(e)},
             status=500
         )
-
 async def start_http_server():
     """Start HTTP server for health checks"""
     try:
@@ -3772,32 +3843,21 @@ async def monitor_database_connection():
 # --- Main Function ---
 async def main():
     try:
-        # Clear webhook at the start
+        # Clear webhook at the start (important for polling)
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             logger.info("Webhook cleared successfully")
         except Exception as e:
             logger.info(f"Webhook clear result: {e}")
         
-        # Startup logging
-        import socket
-        hostname = socket.gethostname()
-        pid = os.getpid()
-        logger.info(f"🚀 Bot starting on host: {hostname}, PID: {pid}")
-        logger.info(f"🔧 Environment: PORT={HTTP_PORT}, Database: PostgreSQL")
-        
         # Setup database and bot
         await setup()
         
-        # Verify setup
-        if not db_pool:
-            logger.critical("PostgreSQL pool not initialized")
-            return
-        
+        # Verify bot info
         if not bot_info:
             logger.critical("Bot info not available")
             return
-
+        
         # Register middleware
         dp.message.middleware(BlockUserMiddleware())
         dp.callback_query.middleware(BlockUserMiddleware())
@@ -3805,33 +3865,24 @@ async def main():
         # Set commands
         await set_bot_commands()
 
-        logger.info("Starting bot polling...")
+        logger.info(f"🚀 Starting bot @{bot_info.username} on Render...")
         
         # Start HTTP server for health checks
         asyncio.create_task(start_http_server())
         
-        # Start database connection monitor
-        asyncio.create_task(monitor_database_connection())
-        
         # Start polling
+        logger.info("Starting polling...")
         await dp.start_polling(
             bot, 
             skip_updates=True, 
-            allowed_updates=dp.resolve_used_update_types(),
-            handle_signals=False
+            allowed_updates=dp.resolve_used_update_types()
         )
         
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
-        await asyncio.sleep(2)
+        # Don't immediately exit, wait a bit
+        await asyncio.sleep(5)
         raise
-    finally:
-        logger.info("Shutting down...")
-        if bot and bot.session:
-            await bot.session.close()
-        if db_pool:
-            await db_pool.close()
-        logger.info("Bot stopped.")
 
 async def shutdown_bot():
     """Clean shutdown"""
