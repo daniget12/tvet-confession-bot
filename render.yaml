@@ -1,7 +1,7 @@
 services:
   - type: web
     name: confession-bot
-    dockerfilePath: ./Dockerfile  # This tells Render to use Dockerfile
+    dockerfilePath: ./Dockerfile  # ← ONLY this line for build config
     envVars:
       - key: BOT_TOKEN
         sync: false
