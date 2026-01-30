@@ -3,4 +3,3 @@ python-dotenv==1.0.0
 aiohttp==3.9.1
 asyncpg==0.29.0
 pytz==2023.3
-psycopg2-binary==2.9.9  # Alternative PostgreSQL adapter
